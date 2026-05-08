@@ -4,12 +4,12 @@ from torch_geometric.nn import MessagePassing
 from torch_geometric.utils import add_self_loops, degree
 
 try:
-    from ..QNN_Node_Embedding import quantum_net
+    from ..qnn_node_embedding import quantum_net
 except ImportError:
     import sys
     import os
     sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
-    from QNN_Node_Embedding import quantum_net
+    from qnn_node_embedding import quantum_net
 
 
 class QGCNConv(MessagePassing):
@@ -44,7 +44,8 @@ class QGCNConv(MessagePassing):
         else:
             self.feature_reduction = None
         
-        self.qc = quantum_net(self.n_qubits, self.n_layers)
+        self.quantum_layer = quantum_net(self.n_qubits, self.n_layers)
+        self.qc = self.quantum_layer
         self.bias = Parameter(torch.empty(n_qubits))
         self.reset_parameters()
 
@@ -67,7 +68,7 @@ class QGCNConv(MessagePassing):
             x_reduced = x
 
         # Step 3: Apply quantum circuit
-        q_out = self.qc(x_reduced).float()
+        q_out = self.quantum_layer(x_reduced).float()
 
         # Step 4: Compute normalization.
         row, col = edge_index

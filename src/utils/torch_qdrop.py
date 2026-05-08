@@ -1,115 +1,85 @@
-"""
-PyTorch implementation of Q-Drop-style gradient controls for quantum parameters.
-
-Supports:
-- Scheduled gradient pruning (accumulate + prune phases)
-- Dynamic quantum dropout (wire-level gradient masking)
-"""
+"""Backward-compatible exports for Torch-side notebook helpers."""
 
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List
+from typing import List
 
-import torch
+from qdrop import QDropConfig, QDropDropoutState, QDropSpecFactory, QDropTensorSpec, SupportsQDropSpec
+from qdrop.backends.torch_runtime import TorchQDropRuntime
+
+TorchQDropConfig = QDropConfig
+QuantumDropCompatible = SupportsQDropSpec
+QuantumDropoutState = QDropDropoutState
 
 
 @dataclass
-class TorchQDropConfig:
-    algorithm: str = "baseline"  # baseline | pruning | dropout | both
-    accumulate_window: int = 10
-    prune_window: int = 8
-    prune_ratio: float = 0.8
-    schedule: bool = True
-    drop_prob: float = 0.5
-    n_drop_wires: int = 1
+class QuantumParameterMetadata(QDropTensorSpec):
+    @property
+    def parameter_name(self) -> str:
+        return self.tensor_id
 
 
-class TorchQDropManager:
-    """
-    Manage Q-Drop masking over quantum gradients in a PyTorch model.
+@dataclass
+class DiscoveredQuantumLayer:
+    module_name: str
+    module: object
+    parameter_specs: List[QuantumParameterMetadata]
 
-    Quantum parameters are inferred by parameter names containing ".qc.weights".
-    """
 
-    def __init__(self, model: torch.nn.Module, config: TorchQDropConfig):
-        self.config = config
-        self.global_step = 0
-        self.accumulate_phase = True
-        self.acc_count = config.accumulate_window
-        self.prune_count = config.prune_window
+def discover_quantum_layers(model) -> List[DiscoveredQuantumLayer]:
+    if hasattr(model, "qdrop_layers"):
+        quantum_layers = model.qdrop_layers()
+    else:
+        quantum_layers = model
 
-        self.quantum_params: Dict[str, torch.nn.Parameter] = {
-            name: p for name, p in model.named_parameters() if ".qc.weights" in name
-        }
-        self.accumulated_grads: Dict[str, torch.Tensor] = {
-            name: torch.zeros_like(param) for name, param in self.quantum_params.items()
-        }
-        self.current_prune_ratio = float(config.prune_ratio)
+    discovered_layers = []
+    for layer_spec in QDropSpecFactory.resolve(quantum_layers):
+        module = next((layer for layer in quantum_layers if layer.qdrop_layer_spec().layer_id == layer_spec.layer_id), None)
+        parameter_specs = [
+            QuantumParameterMetadata(
+                tensor_id=tensor_spec.tensor_id,
+                parameter=tensor_spec.parameter,
+                num_wires=tensor_spec.num_wires,
+                supports_gradient_mask=tensor_spec.supports_gradient_mask,
+                supports_forward_mask=tensor_spec.supports_forward_mask,
+                wire_masks=tensor_spec.wire_masks,
+                mask_builder=tensor_spec.mask_builder,
+            )
+            for tensor_spec in layer_spec.tensor_specs
+        ]
+        discovered_layers.append(
+            DiscoveredQuantumLayer(
+                module_name=layer_spec.layer_id,
+                module=module,
+                parameter_specs=parameter_specs,
+            )
+        )
+    return discovered_layers
 
-    def _step_schedule(self) -> None:
-        if self.accumulate_phase:
-            self.acc_count -= 1
-            if self.acc_count <= 0:
-                self.accumulate_phase = False
-                self.acc_count = self.config.accumulate_window
-        else:
-            self.prune_count -= 1
-            if self.prune_count <= 0:
-                self.accumulate_phase = True
-                self.prune_count = self.config.prune_window
 
-    def _wire_dropout_mask(self, grad: torch.Tensor) -> torch.Tensor:
-        # For qlayer weights [n_layers, n_qubits]: drop full qubit columns.
-        if grad.ndim != 2:
-            return torch.ones_like(grad, dtype=torch.bool)
-        _, n_qubits = grad.shape
-        n_drop = max(1, min(self.config.n_drop_wires, n_qubits))
-        drop_idx = torch.randperm(n_qubits, device=grad.device)[:n_drop]
-        keep_mask = torch.ones_like(grad, dtype=torch.bool)
-        keep_mask[:, drop_idx] = False
-        return keep_mask
+class TorchQDropManager(TorchQDropRuntime):
+    def __init__(self, model=None, config: TorchQDropConfig | None = None, quantum_layers=None):
+        if config is None:
+            config = TorchQDropConfig()
 
-    def _pruning_mask(self, grad: torch.Tensor) -> torch.Tensor:
-        flat = grad.flatten()
-        numel = flat.numel()
-        k = max(1, int(self.current_prune_ratio * numel))
-        if k >= numel:
-            return torch.ones_like(grad, dtype=torch.bool)
-        # Keep top-k by absolute magnitude
-        topk_idx = torch.topk(flat.abs(), k=k, largest=True).indices
-        keep_flat = torch.zeros(numel, dtype=torch.bool, device=grad.device)
-        keep_flat[topk_idx] = True
-        return keep_flat.view_as(grad)
+        if quantum_layers is None:
+            if model is None:
+                quantum_layers = []
+            elif hasattr(model, "qdrop_layers"):
+                quantum_layers = model.qdrop_layers()
+            else:
+                quantum_layers = model
 
-    def apply(self) -> None:
-        if self.config.algorithm == "baseline" or not self.quantum_params:
-            return
+        super().__init__(QDropSpecFactory.resolve(quantum_layers), config)
 
-        self.global_step += 1
-        apply_dropout = self.config.algorithm in ("dropout", "both")
-        apply_pruning = self.config.algorithm in ("pruning", "both")
 
-        for name, param in self.quantum_params.items():
-            if param.grad is None:
-                continue
-            grad = param.grad
-
-            if apply_pruning:
-                if self.accumulate_phase:
-                    self.accumulated_grads[name].add_(grad.detach())
-                else:
-                    pr_mask = self._pruning_mask(self.accumulated_grads[name])
-                    grad = torch.where(pr_mask, self.accumulated_grads[name], torch.zeros_like(grad))
-                    self.accumulated_grads[name].zero_()
-
-            if apply_dropout and torch.rand(1, device=grad.device).item() < self.config.drop_prob:
-                keep_mask = self._wire_dropout_mask(grad)
-                grad = torch.where(keep_mask, grad, torch.zeros_like(grad))
-
-            param.grad.copy_(grad)
-
-        if apply_pruning:
-            self._step_schedule()
-            if self.config.schedule and (self.global_step % 5 == 0):
-                self.current_prune_ratio = min(1.0, self.current_prune_ratio * 1.105170918)  # exp(0.1)
+__all__ = [
+    "DiscoveredQuantumLayer",
+    "QuantumDropCompatible",
+    "QuantumDropoutState",
+    "QuantumParameterMetadata",
+    "TorchQDropConfig",
+    "TorchQDropManager",
+    "discover_quantum_layers",
+]

@@ -1,205 +1,261 @@
+"""Integrated TensorFlow model for Q-Drop and HQGC MNIST experiments."""
+
 import os
-os.environ['TF_CPP_MIN_LOG_LEVEL'] = '2'
+
+os.environ["TF_CPP_MIN_LOG_LEVEL"] = "2"
+
+import random
 import warnings
-warnings.filterwarnings('ignore')
+from typing import Dict, List, Optional, Sequence
 
-import math
 import numpy as np
-import tensorflow as tf
-tf.get_logger().setLevel('ERROR')
-
 import pennylane as qml
+import tensorflow as tf
 from pennylane.templates import AngleEmbedding, BasicEntanglerLayers
-import random as rd
-import sys
-sys.path.insert(0, os.path.dirname(__file__))
 
-from utils.pruning import ScheduledGradientPruning
-from utils.dropout import QuantumDynamicDropoutManager
+from qdrop import QDropConfig, QDropRuntimeFactory
+from qdrop.specs.pennylane_tf import PennyLaneTensorFlowSpecFactory
+
+warnings.filterwarnings("ignore")
+tf.get_logger().setLevel("ERROR")
+
+DEFAULT_ALGORITHM_PARAMS = {
+    "accumulate_window": 10,
+    "prune_window": 8,
+    "prune_ratio": 0.8,
+    "schedule": True,
+}
+SUPPORTED_ALGORITHMS = {"baseline", "pruning", "dropout", "both"}
+def _set_random_seed(random_seed: int) -> None:
+    """Seed every RNG used by the integrated model."""
+    random.seed(random_seed)
+    np.random.seed(random_seed)
+    tf.random.set_seed(random_seed)
+    qml.numpy.random.seed(random_seed)
+
+
+def _resolve_algorithm_params(
+    algorithm_params: Optional[Dict[str, object]],
+) -> Dict[str, object]:
+    """Merge caller overrides with the default Q-Drop settings."""
+    resolved_params = DEFAULT_ALGORITHM_PARAMS.copy()
+    if algorithm_params is not None:
+        resolved_params.update(algorithm_params)
+    return resolved_params
 
 
 class IntegratedQDropHQGCModel(tf.keras.Model):
     """
     Integrated model combining:
-    - Q-Drop Scheduled Gradient Pruning & Dynamic Dropout
-    - HQGC Quantum Components (AngleEmbedding + BasicEntanglerLayers)
+    - Q-Drop scheduled gradient pruning and dynamic dropout
+    - HQGC quantum components (AngleEmbedding + BasicEntanglerLayers)
     - MNIST image classification
     """
 
-    def __init__(self,
-                 n_qubits: int = 4,
-                 n_layers: int = 2,
-                 algorithm: str = 'pruning',  # 'pruning', 'dropout', or 'both'
-                 algorithm_params: dict = None,
-                 apply_dropout: bool = False,
-                 random_seed: int = 42):
-        super(IntegratedQDropHQGCModel, self).__init__()
+    def __init__(
+        self,
+        n_qubits: int = 4,
+        n_layers: int = 2,
+        algorithm: str = "pruning",
+        algorithm_params: Optional[Dict[str, object]] = None,
+        apply_dropout: bool = False,
+        random_seed: int = 42,
+    ):
+        super().__init__()
 
-        # Set seeds for reproducibility
-        rd.seed(random_seed)
-        np.random.seed(random_seed)
-        tf.random.set_seed(random_seed)
-        qml.numpy.random.seed(random_seed)
+        if algorithm not in SUPPORTED_ALGORITHMS:
+            raise ValueError(
+                f"Unsupported algorithm '{algorithm}'. "
+                f"Expected one of: {sorted(SUPPORTED_ALGORITHMS)}"
+            )
+
+        _set_random_seed(random_seed)
 
         self.n_qubits = n_qubits
         self.n_layers = n_layers
         self.algorithm = algorithm
+        self.random_seed = random_seed
+        self.algorithm_params = _resolve_algorithm_params(algorithm_params)
         self.apply_dropout_flag = apply_dropout
 
-        # Classical pre-processing layers
-        self.flatten = tf.keras.layers.Flatten()
-        self.dense_preprocess = tf.keras.layers.Dense(n_qubits, activation='relu', dtype=tf.float32)
-
-        # Quantum weights for BasicEntanglerLayers
-        # Shape: (n_layers, n_qubits) for RX rotations + CNOT gates
+        self.flatten_layer = tf.keras.layers.Flatten()
+        self.preprocess_dense = tf.keras.layers.Dense(
+            n_qubits,
+            activation="relu",
+            dtype=tf.float32,
+        )
         self.quantum_weights = self.add_weight(
             shape=(n_layers, n_qubits),
-            initializer='zeros',
+            initializer="zeros",
             trainable=True,
             dtype=tf.float32,
-            name='quantum_weights'
+            name="quantum_weights",
+        )
+        self.quantum_device = qml.device("default.qubit", wires=n_qubits)
+        self.quantum_circuit = self._build_quantum_circuit()
+        self.qdrop_forward_mask = tf.Variable(
+            tf.ones((n_qubits,), dtype=tf.float32),
+            trainable=False,
+            name="qdrop_forward_mask",
+        )
+        self.postprocess_dense = tf.keras.layers.Dense(32, activation="relu", dtype=tf.float32)
+        self.output_dense = tf.keras.layers.Dense(2, activation="softmax", dtype=tf.float32)
+        self.qdrop_quantum_layer = PennyLaneTensorFlowSpecFactory.create_adapter(
+            layer_id="integrated_quantum_layer",
+            parameter=self.quantum_weights,
+            num_wires=self.n_qubits,
+            mask_builder=self._build_qdrop_mask,
+            set_forward_mask=self._set_qdrop_forward_mask,
+            supports_forward_mask=True,
+        )
+        self.qdrop_runtime = self._build_qdrop_runtime()
+
+        # Backward-compatible aliases for existing scripts and docs.
+        self.flatten = self.flatten_layer
+        self.dense_preprocess = self.preprocess_dense
+        self.dense_postprocess = self.postprocess_dense
+        self.output_layer = self.output_dense
+        self.dev = self.quantum_device
+        self.pruning_algorithm = self.qdrop_runtime if self.algorithm in {"pruning", "both"} else None
+        self.dropout_algorithm = self.qdrop_runtime if self.algorithm in {"dropout", "both"} else None
+        self.pruning_algo = self.pruning_algorithm
+        self.dropout_algo = self.dropout_algorithm
+
+    def _build_quantum_circuit(self):
+        """Create the PennyLane circuit used during forward passes."""
+
+        @qml.qnode(self.quantum_device, interface="numpy", diff_method="parameter-shift")
+        def quantum_circuit(inputs, weights):
+            AngleEmbedding(inputs, wires=range(self.n_qubits), rotation="X")
+            BasicEntanglerLayers(weights, wires=range(self.n_qubits))
+            return [qml.expval(qml.PauliZ(wire_index)) for wire_index in range(self.n_qubits)]
+
+        return quantum_circuit
+
+    def _build_qdrop_runtime(self):
+        if self.algorithm == "baseline":
+            return None
+
+        return QDropRuntimeFactory.create_tensorflow(
+            quantum_layers=self.qdrop_layers(),
+            config=QDropConfig(
+                algorithm=self.algorithm,
+                accumulate_window=self.algorithm_params.get("accumulate_window", 10),
+                prune_window=self.algorithm_params.get("prune_window", 8),
+                prune_ratio=self.algorithm_params.get("prune_ratio", 0.8),
+                schedule=self.algorithm_params.get("schedule", True),
+                dropout_prob=1.0 if self.apply_dropout_flag else 0.5,
+                n_drop_wires=1,
+                enable_forward_mask=True,
+            ),
         )
 
-        # Quantum device with n_qubits wires
-        self.dev = qml.device('default.qubit', wires=n_qubits)
+    def _build_qdrop_mask(self, wire_ids: Sequence[int]) -> tf.Tensor:
+        mask = np.zeros((self.n_layers, self.n_qubits), dtype=bool)
+        for wire_index in wire_ids:
+            if 0 <= wire_index < self.n_qubits:
+                mask[:, wire_index] = True
+        return tf.constant(mask, dtype=tf.bool)
 
-        # Build the quantum node (QNode) using HQGC-style circuits
-        # Use interface='numpy' for stability with eager execution
-        @qml.qnode(self.dev, interface='numpy', diff_method='parameter-shift')
-        def quantum_circuit(inputs, weights):
-            # Angle embedding: each input -> RX rotation
-            AngleEmbedding(inputs, wires=range(n_qubits), rotation='X')
-            # Variational layers with entanglement
-            BasicEntanglerLayers(weights, wires=range(n_qubits))
-            # Measure Pauli-Z on all qubits
-            return [qml.expval(qml.PauliZ(i)) for i in range(n_qubits)]
+    def _set_qdrop_forward_mask(self, dropout_state) -> None:
+        mask = np.ones((self.n_qubits,), dtype=np.float32)
+        if dropout_state is not None and dropout_state.enabled:
+            for wire_index in dropout_state.dropped_wires:
+                if 0 <= wire_index < self.n_qubits:
+                    mask[wire_index] = 0.0
+        self.qdrop_forward_mask.assign(mask)
 
-        self.quantum_circuit = quantum_circuit
+    def qdrop_layers(self):
+        return [self.qdrop_quantum_layer]
 
-        # Classical post-processing
-        self.dense_postprocess = tf.keras.layers.Dense(32, activation='relu', dtype=tf.float32)
-        self.output_layer = tf.keras.layers.Dense(2, activation='softmax', dtype=tf.float32)
+    def _build_pruning_algorithm(self) -> Optional[object]:
+        return self.pruning_algorithm
 
-        # Initialize Q-Drop algorithms
-        if algorithm_params is None:
-            algorithm_params = {
-                'accumulate_window': 10,
-                'prune_window': 8,
-                'prune_ratio': 0.8,
-                'schedule': True
-            }
+    def _build_dropout_algorithm(self) -> Optional[object]:
+        return self.dropout_algorithm
 
-        if algorithm in ['pruning', 'both']:
-            self.pruning_algo = ScheduledGradientPruning(
-                self.quantum_weights,
-                accumulate_window=algorithm_params.get('accumulate_window', 10),
-                prune_window=algorithm_params.get('prune_window', 8),
-                prune_ratio=algorithm_params.get('prune_ratio', 0.8),
-                seed=random_seed,
-                dtype=tf.float32,
-                schedule=algorithm_params.get('schedule', True)
+    @staticmethod
+    def _replace_nan_values(tensor: tf.Tensor) -> tf.Tensor:
+        """Replace NaN values with zeros to keep training numerically stable."""
+        return tf.where(tf.math.is_nan(tensor), tf.zeros_like(tensor), tensor)
+
+    @staticmethod
+    def _to_numpy(value):
+        """Convert TensorFlow values to NumPy in eager-safe fashion."""
+        return value.numpy() if tf.executing_eagerly() else np.asarray(value)
+
+    def _run_quantum_batch(self, embedded_inputs: tf.Tensor) -> tf.Tensor:
+        """Execute the quantum circuit for each sample in the batch."""
+        batch_size = tf.shape(embedded_inputs)[0]
+        batch_quantum_outputs: List[tf.Tensor] = []
+        quantum_weights_np = self._to_numpy(self.quantum_weights)
+
+        for batch_index in tf.range(batch_size):
+            sample_inputs = embedded_inputs[batch_index]
+            circuit_output = np.asarray(
+                self.quantum_circuit(self._to_numpy(sample_inputs), quantum_weights_np),
+                dtype=np.float32,
             )
-        else:
-            self.pruning_algo = None
+            circuit_output = circuit_output * self._to_numpy(self.qdrop_forward_mask)
+            batch_quantum_outputs.append(tf.constant(circuit_output, dtype=tf.float32))
 
-        if algorithm in ['dropout', 'both']:
-            # Define wire-level dropout masks
-            # Map which parameters belong to which wires
+        return tf.stack(batch_quantum_outputs)
 
-            #TODO: For more complex circuits, this mapping would need to be more sophisticated  
-            theta_wire_0 = tf.constant([1, 0, 1, 0] + [0]*(n_qubits*n_layers-4), dtype=tf.int32)
-            theta_wire_1 = tf.constant([0, 1, 0, 0] + [0]*(n_qubits*n_layers-4), dtype=tf.int32)
-            # Use a universal function to calculate mask for any n_qubits and n_layers
-            n_drop = tf.constant(1, dtype=tf.int32)
-            self.drop_flag = tf.Variable(apply_dropout, trainable=False)
+    def _sanitize_gradients(self, gradients: List[Optional[tf.Tensor]]) -> List[tf.Tensor]:
+        """Replace missing or NaN gradients with zeros."""
+        sanitized_gradients: List[tf.Tensor] = []
+        for gradient, variable in zip(gradients, self.trainable_variables):
+            if gradient is None:
+                sanitized_gradients.append(tf.zeros_like(variable))
+            else:
+                sanitized_gradients.append(self._replace_nan_values(gradient))
+        return sanitized_gradients
 
-            self.dropout_algo = QuantumDynamicDropoutManager(
-                self.quantum_weights,
-                theta_wire_0,
-                theta_wire_1,
-                n_drop,
-                self.drop_flag
-            )
-        else:
-            self.dropout_algo = None
+    def _sanitize_trainable_variables(self) -> None:
+        """Remove NaNs from model weights after each optimization step."""
+        for variable in self.trainable_variables:
+            variable.assign(self._replace_nan_values(variable))
 
-    def call(self, inputs):
+    def call(self, inputs, training=None):
+        del training
+
         inputs = tf.cast(inputs, tf.float32)
-        flattened = self.flatten(inputs)
-        preprocessed = self.dense_preprocess(flattened)
-
-        # Run quantum circuit for each preprocessed output
-        batch_size = tf.shape(preprocessed)[0]
-        quantum_outputs_list = []
-
-        for i in tf.range(batch_size):
-            x = preprocessed[i]
-            w = self.quantum_weights
-
-            # Convert to numpy for quantum circuit (numpy interface)
-            x_np = x.numpy() if tf.executing_eagerly() else np.asarray(x)
-            w_np = w.numpy() if tf.executing_eagerly() else np.asarray(w)
-
-            # Execute quantum circuit
-            result = np.array(self.quantum_circuit(x_np, w_np), dtype=np.float32)
-            quantum_outputs_list.append(tf.constant(result, dtype=tf.float32))
-
-        quantum_outputs = tf.stack(quantum_outputs_list)
-
-        # Handle NaN values
-        quantum_outputs = tf.where(tf.math.is_nan(quantum_outputs),
-                                   tf.zeros_like(quantum_outputs), quantum_outputs)
-
-        # Post-process
-        postprocessed = self.dense_postprocess(quantum_outputs)
-        output = self.output_layer(postprocessed)
-
-        return output
+        flattened_inputs = self.flatten_layer(inputs)
+        embedded_inputs = self.preprocess_dense(flattened_inputs)
+        quantum_outputs = self._run_quantum_batch(embedded_inputs)
+        sanitized_outputs = self._replace_nan_values(quantum_outputs)
+        postprocessed_outputs = self.postprocess_dense(sanitized_outputs)
+        return self.output_dense(postprocessed_outputs)
 
     def train_step(self, data):
-        x, y = data
+        inputs, labels = data
+
+        if self.qdrop_runtime is not None and self.optimizer is not None:
+            self.qdrop_runtime.start_epoch(int(self.optimizer.iterations.numpy()) + 1)
 
         with tf.GradientTape() as tape:
-            y_pred = self(x, training=True)
-            loss = self.compiled_loss(y, y_pred, regularization_losses=self.losses)
-
-        # Compute gradients
-        gradients = tape.gradient(loss, self.trainable_variables)
-
-        # Find quantum weights gradient by exact name
-        quantum_grad = None
-        quantum_weights_found = False
-        for idx, var in enumerate(self.trainable_variables):
-            if 'quantum_weights' in var.name:
-                quantum_weights_found = True
-                quantum_grad = gradients[idx]  # may be None if tape lost track through numpy ops
-                break
-
-        if not quantum_weights_found:
-            raise ValueError(
-                f"Quantum weights variable not found in trainable_variables: "
-                f"{[v.name for v in self.trainable_variables]}"
+            predictions = self(inputs, training=True)
+            loss = self.compiled_loss(
+                labels,
+                predictions,
+                regularization_losses=self.losses,
             )
 
-        # Apply Q-Drop algorithms
-        # quantum_grad may be None when the circuit runs via numpy interface (tape can't
-        # differentiate through .numpy() calls); fall back to plain gradient update in that case.
-        if self.algorithm in ['pruning', 'both'] and self.pruning_algo is not None and quantum_grad is not None:
-            self.pruning_algo.apply(quantum_grad, self.optimizer, gradients, self.trainable_variables)
-        else:
-            clean = [g if g is not None else tf.zeros_like(v)
-                     for g, v in zip(gradients, self.trainable_variables)]
-            self.optimizer.apply_gradients(zip(clean, self.trainable_variables))
+        raw_gradients = tape.gradient(loss, self.trainable_variables)
+        processed_gradients = raw_gradients
+        if self.qdrop_runtime is not None:
+            processed_gradients = self.qdrop_runtime.process_gradients(
+                raw_gradients,
+                self.trainable_variables,
+            )
 
-        if self.algorithm in ['dropout', 'both'] and self.dropout_algo is not None:
-            gradients = self.dropout_algo.apply_dropout(gradients, self.trainable_variables)
-            self.optimizer.apply_gradients(zip(gradients, self.trainable_variables))
+        sanitized_gradients = self._sanitize_gradients(processed_gradients)
+        self.optimizer.apply_gradients(zip(sanitized_gradients, self.trainable_variables))
+        if self.qdrop_runtime is not None:
+            self.qdrop_runtime.after_step()
+        self._sanitize_trainable_variables()
 
-        # Sanitize weights: replace NaNs with zeros
-        for var in self.trainable_variables:
-            sanitized_var = tf.where(tf.math.is_nan(var), tf.zeros_like(var), var)
-            var.assign(sanitized_var)
-
-        # Update metrics
-        self.compiled_metrics.update_state(y, y_pred)
-        return {m.name: m.result() for m in self.metrics}
+        self.compiled_metrics.update_state(labels, predictions)
+        metric_results = {metric.name: metric.result() for metric in self.metrics}
+        metric_results["loss"] = loss
+        return metric_results

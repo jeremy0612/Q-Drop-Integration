@@ -12,6 +12,12 @@ This project integrates two leading quantum ML innovations:
    - Quantum Neural Networks using AngleEmbedding + BasicEntanglerLayers
    - Message-passing inspired quantum circuits
 
+## Current Status
+
+- **Active training path:** Torch + PyTorch Geometric graph training on MUTAG and PROTEINS via `src/train_quantum_models.py`
+- **Reusable Q-Drop path:** Torch-side quantum-layer contract + shared Q-Drop runtime for graph models
+- **Legacy/reference path:** TensorFlow MNIST integration in `src/train_mnist.py` and `src/models/integrated_model.py`
+
 ## Architecture
 
 The integrated model combines:
@@ -65,41 +71,33 @@ conda activate Penny2
 
 ## Quick Start
 
-Run the complete training pipeline:
+Train quantum graph models on MUTAG and PROTEINS (canonical Torch entry point):
 
 ```bash
-cd code
-python train_mnist.py
-```
-
-Train quantum graph models on MUTAG and PROTEINS (unified script):
-
-```bash
-cd Q-Drop-Integration/src
+cd Q_Drop_Intergration/src
 python train_quantum_models.py --datasets mutag proteins
 ```
 
-Run with Q-Drop modes on HQGC quantum weights:
+Run with research-style Q-Drop modes on graph quantum weights:
 
 ```bash
 python train_quantum_models.py --datasets mutag proteins --algorithm both
 ```
 
-Run vulnerability QGAT pipeline from this folder:
+Dataset-specific wrappers still exist and now call the shared Torch training core:
 
 ```bash
-cd Q-Drop-Integration
-python src/train_vulnerability_qgat.py
+python train_mutag.py
+python train_proteins.py
 ```
 
-Generate vulnerability IEEE figures from this folder:
+Run the legacy/reference TensorFlow MNIST pipeline:
 
 ```bash
-cd Q-Drop-Integration
-python src/plot_vulnerability_ieee.py
+python train_mnist.py
 ```
 
-This will:
+The legacy MNIST script will:
 1. Load and preprocess MNIST (binary classification: digit 3 vs digit 6)
 2. Train with **Scheduled Gradient Pruning** only
 3. Train with **Dynamic Quantum Dropout** only

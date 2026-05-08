@@ -145,7 +145,7 @@ Same architecture but accepts a **pluggable `GCNConvLayer`** — either classica
 
 ### 2.2 Custom GCNConv Layer
 
-Defined in [Custom_GCNConv.py](HQGC-Hybrid-Quantum-Classical-Graph-Convolutional-Network/code/models/GCNConv_Layers/Custom_GCNConv.py), this implements the standard GCN message-passing:
+Defined in [custom_gcn_conv.py](HQGC-Hybrid-Quantum-Classical-Graph-Convolutional-Network/code/models/gcn_conv_layers/custom_gcn_conv.py), this implements the standard GCN message-passing:
 
 1. Add self-loops to adjacency
 2. Optionally transform features via `Linear(in, out)` (controlled by `no_node_NN` flag)
@@ -155,7 +155,7 @@ Defined in [Custom_GCNConv.py](HQGC-Hybrid-Quantum-Classical-Graph-Convolutional
 
 ### 2.3 Quantum Node Embedding (QNN)
 
-Defined in [QNN_Node_Embedding.py](HQGC-Hybrid-Quantum-Classical-Graph-Convolutional-Network/code/models/QNN_Node_Embedding.py):
+Defined in [qnn_node_embedding.py](HQGC-Hybrid-Quantum-Classical-Graph-Convolutional-Network/code/models/qnn_node_embedding.py):
 
 ```python
 def quantum_net(n_qubits, n_layers):
@@ -174,7 +174,7 @@ def quantum_net(n_qubits, n_layers):
 
 ### 2.4 Quantum GCN Convolution (QGCNConv)
 
-Defined in [QGCNConv.py](HQGC-Hybrid-Quantum-Classical-Graph-Convolutional-Network/code/models/GCNConv_Layers/QGCNConv.py), this replaces the classical linear transform in GCN with a quantum circuit:
+Defined in [qgcn_conv.py](HQGC-Hybrid-Quantum-Classical-Graph-Convolutional-Network/code/models/gcn_conv_layers/qgcn_conv.py), this replaces the classical linear transform in GCN with a quantum circuit:
 
 ```
 Node features x [N, in_channels]
@@ -191,7 +191,7 @@ The quantum circuit replaces the `Wx` linear transformation with a variational q
 
 ### 2.5 QGCN Full Model
 
-Defined in [Quantum_GCN.py](HQGC-Hybrid-Quantum-Classical-Graph-Convolutional-Network/code/models/Quantum_GCN.py):
+Defined in [quantum_gcn.py](HQGC-Hybrid-Quantum-Classical-Graph-Convolutional-Network/code/models/quantum_gcn.py):
 
 ```
 Graph input (x, edge_index, batch)
