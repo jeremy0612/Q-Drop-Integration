@@ -3,8 +3,22 @@ name: Quantum Graph Training — MUTAG & PROTEINS
 on:
   push:
     branches: [feat/torch_qdrop]
+    paths:
+      - "src/models/**"
+      - "src/qdrop/**"
+      - "src/training/**"
+      - "src/data/**"
+      - "src/train_quantum_models.py"
+      - ".github/workflows/train_quantum_graph.yml"
   pull_request:
     branches: [feat/torch_qdrop]
+    paths:
+      - "src/models/**"
+      - "src/qdrop/**"
+      - "src/training/**"
+      - "src/data/**"
+      - "src/train_quantum_models.py"
+      - ".github/workflows/train_quantum_graph.yml"
   workflow_dispatch:
     inputs:
       algorithm:

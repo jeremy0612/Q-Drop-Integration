@@ -1,0 +1,454 @@
+name: Q-Drop Grid Search — MUTAG & PROTEINS
+
+on:
+  workflow_dispatch:
+    inputs:
+      datasets:
+        description: "Datasets to sweep (space-separated)"
+        required: false
+        default: "mutag proteins"
+      folds:
+        description: "Cross-validation folds per combo"
+        required: false
+        default: "10"
+      max_combos:
+        description: "Max combos to run (0 = all)"
+        required: false
+        default: "0"
+
+jobs:
+  grid-search:
+    runs-on: [A6000]
+    permissions:
+      contents: write
+      pull-requests: write
+
+    env:
+      TORCH_VERSION: "2.2.0"
+      CUDA_TAG: "cu121"
+      OUTPUT_DIR: training_results
+
+    steps:
+      - name: Add npm global bin to PATH
+        run: echo "$HOME/.npm-global/bin" >> $GITHUB_PATH
+
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: System info
+        run: |
+          echo "=== System ==="
+          uname -a
+          nvidia-smi || echo "No GPU detected"
+          echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-all}"
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install CML
+        run: |
+          npm install -g @dvcorg/cml
+
+      - name: Install PyTorch (CUDA 12.1)
+        run: |
+          python -m pip install --upgrade pip setuptools wheel
+          pip install torch==2.2.0 --index-url https://download.pytorch.org/whl/cu121
+
+      - name: Install PyTorch Geometric
+        run: |
+          pip install \
+            pyg_lib \
+            torch_scatter \
+            torch_sparse \
+            torch_cluster \
+            torch_spline_conv \
+            -f https://data.pyg.org/whl/torch-2.2.0+cu121.html
+          pip install torch-geometric
+
+      - name: Install training dependencies
+        run: |
+          pip install \
+            "pennylane==0.38.0" \
+            "pennylane-lightning==0.38.0" \
+            "scikit-learn>=1.3.0" \
+            "numpy>=1.24.0" \
+            "matplotlib>=3.7.0" \
+            "tqdm>=4.66.0" \
+            "datasets>=2.18.0" \
+            "seaborn>=0.13.0"
+
+      - name: Verify environment
+        run: |
+          python - << 'PYEOF'
+          import torch, torch_geometric, pennylane, sklearn, numpy, datasets, seaborn
+          print(f"PyTorch:        {torch.__version__}")
+          print(f"CUDA available: {torch.cuda.is_available()}")
+          if torch.cuda.is_available():
+              print(f"GPU:            {torch.cuda.get_device_name(0)}")
+              props = torch.cuda.get_device_properties(0)
+              print(f"VRAM:           {props.total_memory / 1e9:.1f} GB")
+          print(f"PyG:            {torch_geometric.__version__}")
+          print(f"PennyLane:      {pennylane.__version__}")
+          print(f"scikit-learn:   {sklearn.__version__}")
+          print(f"NumPy:          {numpy.__version__}")
+          print(f"seaborn:        {seaborn.__version__}")
+          PYEOF
+
+      - name: Run Q-Drop grid search
+        id: grid
+        env:
+          DATASETS: ${{ github.event.inputs.datasets || 'mutag proteins' }}
+          FOLDS: ${{ github.event.inputs.folds || '10' }}
+        run: |
+          echo "=== Q-Drop Grid Search ==="
+          echo "Datasets: $DATASETS"
+          echo "Folds: $FOLDS"
+          echo ""
+
+          python src/grid_search_qdrop.py \
+            --datasets $DATASETS \
+            --output-dir "$OUTPUT_DIR"
+
+          GRID_DIR=$(ls -dt "$OUTPUT_DIR"/grid_search_* 2>/dev/null | head -1)
+          if [ -z "$GRID_DIR" ]; then
+            echo "ERROR: no grid search output found under $OUTPUT_DIR"
+            exit 1
+          fi
+          echo "GRID_DIR=$GRID_DIR" >> $GITHUB_ENV
+          echo "Results at: $GRID_DIR"
+          ls -lah "$GRID_DIR"
+
+      - name: Generate CML report
+        env:
+          MPLCONFIGDIR: /tmp/matplotlib
+          REPO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cml ci
+
+          python - << 'PYEOF'
+          import csv
+          import json
+          import math
+          import os
+          from collections import defaultdict
+          from pathlib import Path
+
+          import matplotlib.pyplot as plt
+          import numpy as np
+          import seaborn as sns
+
+          grid_dir = Path(os.environ["GRID_DIR"])
+          assets_dir = grid_dir / "report_assets"
+          assets_dir.mkdir(parents=True, exist_ok=True)
+          ref = os.environ.get("GITHUB_REF_NAME", "unknown")
+          sha = os.environ.get("GITHUB_SHA", "")[:8]
+          run_id = os.environ.get("GITHUB_RUN_ID", "")
+          repo = os.environ.get("GITHUB_REPOSITORY", "")
+          run_url = f"https://github.com/{repo}/actions/runs/{run_id}" if repo and run_id else "#"
+
+          csv_path = grid_dir / "grid_results.csv"
+          if not csv_path.exists():
+              print("ERROR: grid_results.csv not found")
+              exit(1)
+
+          rows = []
+          with open(csv_path, encoding="utf-8") as f:
+              reader = csv.DictReader(f)
+              for row in reader:
+                  rows.append(row)
+
+          if not rows:
+              with open("report.md", "w", encoding="utf-8") as report_file:
+                  report_file.write("# Q-Drop Grid Search Report\n\nNo results found.\n")
+              exit(0)
+
+          datasets = sorted(set(r["dataset"] for r in rows))
+          algorithms = sorted(set(r["algorithm"] for r in rows))
+          metrics = ["accuracy", "f1", "roc_auc", "pr_auc", "precision", "recall"]
+
+          def _float(v, default=float("nan")):
+              try:
+                  return float(v)
+              except (TypeError, ValueError):
+                  return default
+
+          def format_scalar(value):
+              if value is None:
+                  return "—"
+              if isinstance(value, bool):
+                  return "Yes" if value else "No"
+              if isinstance(value, float):
+                  if math.isnan(value) or math.isinf(value):
+                      return "—"
+                  return f"{value:.4f}"
+              return str(value)
+
+          def param_label(key):
+              labels = {
+                  "accumulate_window": "Accum. Window",
+                  "prune_window": "Prune Window",
+                  "prune_ratio": "Prune Ratio",
+                  "qdrop_schedule": "Q-Drop Schedule",
+                  "dropout_prob": "Dropout Prob",
+                  "n_drop_wires": "Dropped Wires",
+                  "enable_forward_mask": "Forward Mask",
+              }
+              return labels.get(key, key)
+
+          # ── Best configs per dataset × algorithm ──
+          best = {}
+          for ds in datasets:
+              for algo in algorithms:
+                  algo_rows = [r for r in rows if r["dataset"] == ds and r["algorithm"] == algo]
+                  if algo_rows:
+                      best[(ds, algo)] = max(algo_rows, key=lambda r: _float(r.get("mean_accuracy", 0)))
+
+          # ── Parameter sensitivity plots ──
+          pruning_params = ["accumulate_window", "prune_window", "prune_ratio", "qdrop_schedule"]
+          dropout_params = ["dropout_prob", "n_drop_wires", "enable_forward_mask"]
+
+          sensitivity_charts = []
+
+          for ds in datasets:
+              for params, algo_filter in [(pruning_params, ["pruning", "both"]), (dropout_params, ["dropout", "both"])]:
+                  algo_rows = [r for r in rows if r["dataset"] == ds and r["algorithm"] in algo_filter]
+                  if not algo_rows:
+                      continue
+
+                  n_params = len([p for p in params if any(r.get(p, "") != "" for r in algo_rows)])
+                  if n_params == 0:
+                      continue
+
+                  active_params = [p for p in params if any(r.get(p, "") != "" for r in algo_rows)]
+                  n_rows = int(math.ceil(len(active_params) / 2))
+                  fig, axes = plt.subplots(n_rows, 2, figsize=(14, 5 * n_rows), squeeze=False)
+
+                  for idx, param in enumerate(active_params):
+                      ax = axes[idx // 2][idx % 2]
+                      unique_vals = sorted(set(r[param] for r in algo_rows if r.get(param, "") != ""),
+                                          key=lambda x: x.lower() if isinstance(x, str) else float(x) if x.replace(".", "").replace("-", "").isdigit() else x)
+
+                      if param in ("qdrop_schedule", "enable_forward_mask"):
+                          unique_vals = ["True", "False"]
+
+                      means = []
+                      stds = []
+                      for val in unique_vals:
+                          group = [r for r in algo_rows if str(r.get(param, "")) == val]
+                          accs = [_float(r.get("mean_accuracy", 0)) for r in group]
+                          means.append(np.mean(accs))
+                          stds.append(np.std(accs))
+
+                      x = np.arange(len(unique_vals))
+                      ax.bar(x, means, yerr=stds, capsize=5, color="#2E86AB", alpha=0.85)
+                      ax.set_xticks(x)
+                      ax.set_xticklabels(unique_vals, rotation=30, ha="right", fontsize=9)
+                      ax.set_title(f"{param_label(param)} — {ds.upper()} ({'+'.join(algo_filter)})",
+                                   fontsize=11, weight="bold")
+                      ax.set_ylabel("Mean Accuracy")
+                      ax.set_ylim(max(0, min(means) - 0.15), min(1, max(means) + 0.15))
+                      ax.grid(axis="y", linestyle="--", alpha=0.3)
+
+                  for idx in range(len(active_params), n_rows * 2):
+                      axes[idx // 2][idx % 2].set_axis_off()
+
+                  fig.tight_layout()
+                  chart_path = assets_dir / f"sensitivity_{ds}_{'-'.join(algo_filter)}.png"
+                  fig.savefig(chart_path, dpi=200, bbox_inches="tight")
+                  plt.close(fig)
+                  sensitivity_charts.append(chart_path)
+
+          # ── Top-N heatmap for "both" algorithm ──
+          heatmap_chart = None
+          both_rows = [r for r in rows if r["algorithm"] == "both"]
+          if both_rows and len(both_rows) >= 6:
+              top_n = min(20, len(both_rows))
+              both_sorted = sorted(both_rows, key=lambda r: _float(r.get("mean_accuracy", 0)), reverse=True)
+              top = both_sorted[:top_n]
+
+              heatmap_data = []
+              heatmap_labels = []
+              for r in top:
+                  label_parts = []
+                  for p in pruning_params + dropout_params:
+                      val = r.get(p, "")
+                      if val != "":
+                          label_parts.append(f"{param_label(p).split()[0]}={val}")
+                  heatmap_labels.append(" | ".join(label_parts))
+                  heatmap_data.append([_float(r.get(f"mean_{m}", 0)) for m in metrics])
+
+              fig, ax = plt.subplots(figsize=(16, max(6, top_n * 0.4)))
+              heatmap_array = np.array(heatmap_data)
+              sns.heatmap(heatmap_array, annot=True, fmt=".3f", cmap="YlOrRd",
+                          xticklabels=[m.upper() for m in metrics],
+                          yticklabels=heatmap_labels,
+                          ax=ax, cbar_kws={"label": "Score"}, vmin=0, vmax=1)
+              ax.set_title(f"Top {top_n} Configs (Both) — All Datasets", fontsize=13, weight="bold")
+              ax.set_xlabel("Metric")
+              ax.set_ylabel("Configuration")
+              fig.tight_layout()
+              heatmap_chart = assets_dir / "top_configs_heatmap.png"
+              fig.savefig(heatmap_chart, dpi=200, bbox_inches="tight")
+              plt.close(fig)
+
+          # ── Build markdown report ──
+          lines = [
+              "# Q-Drop Grid Search Report — MUTAG & PROTEINS",
+              "",
+              f"**Branch:** `{ref}` | **Commit:** `{sha}` | **Run:** [{run_id}]({run_url})",
+              "",
+              "## Search Summary",
+              "",
+              f"- **Total combinations evaluated:** {len(rows)}",
+              f"- **Datasets:** {', '.join(d.upper() for d in datasets)}",
+              f"- **Algorithms:** {', '.join(algorithms)}",
+          ]
+
+          lines += ["", "## Best Configuration per Dataset × Algorithm", ""]
+          for ds in datasets:
+              lines.append(f"### {ds.upper()}")
+              lines.append("")
+              lines.append("| Algorithm | Accuracy | F1 | ROC AUC | Best Params |")
+              lines.append("|-----------|----------|----|---------|-------------|")
+              for algo in algorithms:
+                  key = (ds, algo)
+                  if key not in best:
+                      continue
+                  r = best[key]
+                  param_strs = []
+                  for p in pruning_params + dropout_params:
+                      val = r.get(p, "")
+                      if val != "":
+                          param_strs.append(f"{param_label(p)}={val}")
+                  param_text = ", ".join(param_strs) if param_strs else "—"
+                  lines.append(
+                      f"| {algo} | {format_scalar(_float(r.get('mean_accuracy')))} "
+                      f"± {format_scalar(_float(r.get('std_accuracy')))} | "
+                      f"{format_scalar(_float(r.get('mean_f1')))} "
+                      f"± {format_scalar(_float(r.get('std_f1')))} | "
+                      f"{format_scalar(_float(r.get('mean_roc_auc')))} "
+                      f"± {format_scalar(_float(r.get('std_roc_auc')))} | "
+                      f"{param_text} |"
+                  )
+              lines.append("")
+
+          # Full best config detail
+          lines += ["", "## Best Config Detail", ""]
+          for ds in datasets:
+              for algo in algorithms:
+                  key = (ds, algo)
+                  if key not in best:
+                      continue
+                  r = best[key]
+                  lines.append(f"### {ds.upper()} — {algo}")
+                  lines.append("")
+                  lines.append("| Metric | Mean ± Std |")
+                  lines.append("|--------|------------|")
+                  for m in metrics:
+                      lines.append(
+                          f"| {m.upper()} | {format_scalar(_float(r.get(f'mean_{m}')))} "
+                          f"± {format_scalar(_float(r.get(f'std_{m}')))} |"
+                      )
+                  lines.append("")
+                  lines.append("| Parameter | Value |")
+                  lines.append("|-----------|-------|")
+                  for p in pruning_params + dropout_params:
+                      val = r.get(p, "")
+                      if val != "":
+                          lines.append(f"| {param_label(p)} | {val} |")
+                  lines.append("")
+
+          # Top 10 overall
+          lines += ["", "## Top 10 Configurations (by Accuracy)", ""]
+          all_sorted = sorted(rows, key=lambda r: _float(r.get("mean_accuracy", 0)), reverse=True)
+          top10 = all_sorted[:10]
+          lines.append("| # | Dataset | Algorithm | Accuracy | F1 | Key Params |")
+          lines.append("|---|---------|-----------|----------|----|------------|")
+          for idx, r in enumerate(top10, 1):
+              param_strs = []
+              for p in pruning_params + dropout_params:
+                  val = r.get(p, "")
+                  if val != "":
+                      param_strs.append(f"{param_label(p).split()[0]}={val}")
+              param_text = ", ".join(param_strs[:6])
+              lines.append(
+                  f"| {idx} | {r['dataset'].upper()} | {r['algorithm']} | "
+                  f"{format_scalar(_float(r.get('mean_accuracy')))} "
+                  f"± {format_scalar(_float(r.get('std_accuracy')))} | "
+                  f"{format_scalar(_float(r.get('mean_f1')))} "
+                  f"± {format_scalar(_float(r.get('std_f1')))} | "
+                  f"{param_text} |"
+              )
+          lines.append("")
+
+          # Per-algorithm summary
+          lines += ["", "## Algorithm Comparison", ""]
+          lines.append("| Algorithm | Dataset | Avg Accuracy | Best Accuracy | Combos |")
+          lines.append("|-----------|---------|-------------|---------------|--------|")
+          for algo in algorithms:
+              for ds in datasets:
+                  algo_rows = [r for r in rows if r["dataset"] == ds and r["algorithm"] == algo]
+                  if not algo_rows:
+                      continue
+                  accs = [_float(r.get("mean_accuracy", 0)) for r in algo_rows]
+                  avg_acc = np.mean(accs)
+                  best_acc = max(accs)
+                  lines.append(
+                      f"| {algo} | {ds.upper()} | {avg_acc:.4f} | {best_acc:.4f} | {len(algo_rows)} |"
+                  )
+          lines.append("")
+
+          lines += [
+              "",
+              "## Parameter Sensitivity",
+              "",
+              "The charts below show how each Q-Drop parameter affects mean accuracy across all runs.",
+          ]
+
+          with open("report.md", "w", encoding="utf-8") as report_file:
+              report_file.write("\n".join(lines) + "\n")
+
+          for chart in sensitivity_charts:
+              chart_name = chart.stem.replace("_", " ").title()
+              with open("report.md", "a", encoding="utf-8") as report_file:
+                  report_file.write(f"\n### {chart_name}\n\n")
+              import subprocess
+              result = subprocess.run(
+                  ["cml", "publish", str(chart), "--md"],
+                  capture_output=True, text=True
+              )
+              with open("report.md", "a", encoding="utf-8") as report_file:
+                  report_file.write(result.stdout + "\n")
+
+          if heatmap_chart and heatmap_chart.exists():
+              with open("report.md", "a", encoding="utf-8") as report_file:
+                  report_file.write("\n### Top Configs Heatmap\n\n")
+              result = subprocess.run(
+                  ["cml", "publish", str(heatmap_chart), "--md"],
+                  capture_output=True, text=True
+              )
+              with open("report.md", "a", encoding="utf-8") as report_file:
+                  report_file.write(result.stdout + "\n")
+
+          # Append link to raw CSV
+          csv_rel = f"./{grid_dir.name}/grid_results.csv"
+          with open("report.md", "a", encoding="utf-8") as report_file:
+              report_file.write(f"\n## Raw Results\n\nFull CSV: `{csv_rel}`\n")
+
+          cml comment create report.md
+          PYEOF
+
+      - name: Upload grid search artifacts
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: qdrop-grid-search-${{ github.run_id }}
+          path: |
+            ${{ env.GRID_DIR }}/grid_results.csv
+            ${{ env.GRID_DIR }}/grid_results.json
+            ${{ env.GRID_DIR }}/report_assets/*.png
+            report.md
+          retention-days: 30
