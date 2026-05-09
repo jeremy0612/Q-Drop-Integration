@@ -1,11 +1,31 @@
-"""Quantum node embedding utilities for graph models."""
+"""
+Quantum Neural Network circuit for node embedding.
+Uses PennyLane with AngleEmbedding and variational layers.
+"""
 
-try:
-    from .quantum_circuit_adapter import QuantumCircuitAdapter
-except ImportError:
-    from models.quantum_circuit_adapter import QuantumCircuitAdapter
+import torch
+import pennylane as qml
 
 
-def quantum_net(n_qubits, n_layers):
-    """Create a Q-Drop-compatible quantum node embedding layer."""
-    return QuantumCircuitAdapter(n_qubits=n_qubits, n_layers=n_layers)
+def quantum_net(n_qubits, n_layers, device_name=None):
+    """
+    Create a quantum neural network module for node embedding.
+
+    Args:
+        n_qubits: Number of qubits
+        n_layers: Number of variational layers
+
+    Returns:
+        torch.nn.Module that maps [N, n_qubits] -> [N, n_qubits]
+    """
+    dev = qml.device(device_name or "default.qubit", wires=n_qubits)
+
+    @qml.qnode(dev, interface="torch")
+    def qnode(inputs, weights):
+        qml.templates.AngleEmbedding(inputs, wires=range(n_qubits))
+        qml.templates.BasicEntanglerLayers(weights, wires=range(n_qubits))
+        return [qml.expval(qml.PauliZ(i)) for i in range(n_qubits)]
+
+    weight_shapes = {"weights": (n_layers, n_qubits)}
+    qlayer = qml.qnn.TorchLayer(qnode, weight_shapes)
+    return qlayer

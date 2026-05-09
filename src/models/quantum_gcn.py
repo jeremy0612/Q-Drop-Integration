@@ -1,42 +1,33 @@
 import torch
-from torch.nn import Linear, LeakyReLU, Module, ModuleList
+from torch.nn import Module, ModuleList, Linear, LeakyReLU
 from torch_geometric.nn import global_mean_pool
 
 try:
-    from .gcn_conv_layers import QGCNConv
+    from .GCNConv_Layers import QGCNConv
 except ImportError:
-    from gcn_conv_layers import QGCNConv
+    from GCNConv_Layers import QGCNConv
 
 
 class QGCN(Module):
     """QGCN with Linear classifier only."""
 
-    def __init__(
-        self,
-        input_dims,
-        q_depths,
-        output_dims,
-        activ_fn=LeakyReLU(0.2),
-        classifier=None,
-        readout=False,
-        n_qubits=None,
-    ):
+    def __init__(self, input_dims, q_depths, output_dims, activ_fn=LeakyReLU(0.2), classifier=None, readout=False, max_qubits=8):
+
         super().__init__()
         layers = []
-        max_qubits = 16
-        if n_qubits is None:
-            n_qubits = min(input_dims, max_qubits)
-        else:
-            n_qubits = min(n_qubits, max_qubits)
-
+        n_qubits = min(input_dims, max_qubits)
         if n_qubits > 8:
             n_qubits = 16
-        else:
+        elif n_qubits > 4:
             n_qubits = 8
+        elif n_qubits > 2:
+            n_qubits = 4
+        else:
+            n_qubits = 2
         self.n_qubits = n_qubits
 
-        for index, q_depth in enumerate(q_depths):
-            layer_input_dims = input_dims if index == 0 else n_qubits
+        for i, q_depth in enumerate(q_depths):
+            layer_input_dims = input_dims if i == 0 else n_qubits
             qgcn_conv = QGCNConv(layer_input_dims, q_depth, n_qubits=n_qubits)
             layers.append(qgcn_conv)
 
@@ -50,26 +41,23 @@ class QGCN(Module):
 
         self.classifier = Linear(self.n_qubits, output_dims)
 
-    def qdrop_layers(self):
-        quantum_layers = []
-        for layer_index, layer in enumerate(self.layers):
-            quantum_layer = getattr(layer, "quantum_layer", None)
-            if quantum_layer is None:
-                continue
-            quantum_layer.qdrop_name = f"layers.{layer_index}.quantum_layer"
-            quantum_layers.append(quantum_layer)
-        return quantum_layers
-
     def forward(self, x, edge_index, batch):
+        """
+        Defining how tensors are supposed to move through the *dressed* quantum
+        net.
+        """
+
         h = x
-        for layer in self.layers:
-            h = layer(h, edge_index)
+        for i in range(len(self.layers)):
+            h = self.layers[i](h, edge_index)
             h = self.activ_fn(h)
 
+        # readout layer to get the embedding for each graph in batch
         h = global_mean_pool(h, batch)
         h = self.classifier(h)
 
         if self.readout is not None:
             h = self.readout(h)
 
+        # return the prediction from the postprocessing layer
         return h

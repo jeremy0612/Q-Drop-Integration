@@ -1,0 +1,28 @@
+Warning: You are sending unauthenticated requests to the HF Hub. Please set a HF_TOKEN to enable higher rate limits and faster downloads.
+========================================================================
+QGAT GRID SEARCH  —  algorithms × qubits × Q-Drop params
+========================================================================
+Datasets        : ['MUTAG', 'PROTEINS']
+Layer depths    : [1]
+Qubit options   : [4, 8]
+── Q-Drop param grids ──────────────────────────────────
+  prune_ratios        (pruning/both)  : [0.5, 0.8, 0.9]
+  accumulate_windows  (pruning/both)  : [10]
+  prune_windows       (pruning/both)  : [8]
+  drop_probs          (dropout/both)  : [0.3, 0.5, 0.7]
+  n_drop_wires        (dropout/both)  : [1]
+── Cells per algorithm ─────────────────────────────────
+  baseline  : 4 cells
+  pruning   : 12 cells
+  dropout   : 12 cells
+  both      : 36 cells
+  TOTAL     : 64 cells  ×  10 folds  =  640 runs
+Epochs / folds  : 100 / 10
+Device          : cuda
+Output          : /home/cislab301b/Khanh/Q-Drop-Integration/training_results/qgat_gridsearch_20260510_034919
+========================================================================
+  MUTAG: 188 graphs | feat_dim=7 | classes={0, 1}
+  PROTEINS: 1113 graphs | feat_dim=3 | classes={0, 1}
+
+[1/64]  baseline_MUTAG_L1_Q4
+MUT-BAS-L1Q4-F1:   0%|          | 0/100 [00:00<?, ?it/s]MUT-BAS-L1Q4-F1:   1%|          | 1/100 [01:08<1:52:26, 68.15s/it]MUT-BAS-L1Q4-F1:   2%|▏         | 2/100 [01:48<1:24:21, 51.65s/it]MUT-BAS-L1Q4-F1:   3%|▎         | 3/100 [02:22<1:10:20, 43.51s/it]MUT-BAS-L1Q4-F1:   4%|▍         | 4/100 [03:03<1:08:07, 42.57s/it]MUT-BAS-L1Q4-F1:   5%|▌         | 5/100 [03:43<1:05:53, 41.61s/it]MUT-BAS-L1Q4-F1:   6%|▌         | 6/100 [04:34<1:10:36, 45.07s/it]MUT-BAS-L1Q4-F1:   7%|▋         | 7/100 [05:08<1:04:13, 41.44s/it]MUT-BAS-L1Q4-F1:   8%|▊         | 8/100 [06:02<1:09:35, 45.39s/it]MUT-BAS-L1Q4-F1:   9%|▉         | 9/100 [06:44<1:07:07, 44.26s/it]MUT-BAS-L1Q4-F1:  10%|█         | 10/100 [07:16<1:00:36, 40.41s/it]MUT-BAS-L1Q4-F1:  11%|█         | 11/100 [07:53<58:42, 39.58s/it]  MUT-BAS-L1Q4-F1:  12%|█▏        | 12/100 [08:58<1:09:15, 47.22s/it]
