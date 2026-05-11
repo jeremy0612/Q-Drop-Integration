@@ -36,7 +36,7 @@ on:
 
 jobs:
   train:
-    runs-on: [P60000]
+    runs-on: [A6000]
     permissions:
       contents: write
       pull-requests: write
