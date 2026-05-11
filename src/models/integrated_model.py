@@ -20,9 +20,9 @@ warnings.filterwarnings("ignore")
 tf.get_logger().setLevel("ERROR")
 
 DEFAULT_ALGORITHM_PARAMS = {
-    "accumulate_window": 10,
+    "accumulate_window": 50,
     "prune_window": 8,
-    "prune_ratio": 0.8,
+    "prune_ratio": 0.7,
     "schedule": True,
 }
 SUPPORTED_ALGORITHMS = {"baseline", "pruning", "dropout", "both"}
