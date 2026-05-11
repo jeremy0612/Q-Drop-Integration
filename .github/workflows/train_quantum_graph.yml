@@ -66,9 +66,9 @@ jobs:
         with:
           python-version: "3.10"
 
-      - name: Install CML
-        run: |
-          npm install -g @dvcorg/cml
+    #   - name: Install CML
+    #     run: |
+    #       npm install -g @dvcorg/cml
 
       - name: Install PyTorch (CUDA 12.1)
         run: |
