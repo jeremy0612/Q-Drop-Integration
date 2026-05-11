@@ -762,25 +762,33 @@ jobs:
               report_file.write("\n".join(lines) + "\n")
           PYEOF
 
+          # cml publish is deprecated; cml comment create now auto-uploads
+          # local assets referenced via inline ![alt](./path) markdown.
           if [ -f "$RESULTS_DIR/report_assets/quantum_graph_overview.png" ]; then
-            echo "" >> report.md
-            echo "### Performance Overview" >> report.md
-            echo "" >> report.md
-            cml publish "$RESULTS_DIR/report_assets/quantum_graph_overview.png" --md >> report.md
+            {
+              echo ""
+              echo "### Performance Overview"
+              echo ""
+              echo "![Performance Overview](./$RESULTS_DIR/report_assets/quantum_graph_overview.png)"
+            } >> report.md
           fi
 
           if [ -f "$RESULTS_DIR/report_assets/quantum_graph_learning_curves.png" ]; then
-            echo "" >> report.md
-            echo "### Best-Fold Learning Curves" >> report.md
-            echo "" >> report.md
-            cml publish "$RESULTS_DIR/report_assets/quantum_graph_learning_curves.png" --md >> report.md
+            {
+              echo ""
+              echo "### Best-Fold Learning Curves"
+              echo ""
+              echo "![Best-Fold Learning Curves](./$RESULTS_DIR/report_assets/quantum_graph_learning_curves.png)"
+            } >> report.md
           fi
 
           if [ -f "$RESULTS_DIR/report_assets/quantum_graph_qdrop_progress.png" ]; then
-            echo "" >> report.md
-            echo "### Q-Drop Progress" >> report.md
-            echo "" >> report.md
-            cml publish "$RESULTS_DIR/report_assets/quantum_graph_qdrop_progress.png" --md >> report.md
+            {
+              echo ""
+              echo "### Q-Drop Progress"
+              echo ""
+              echo "![Q-Drop Progress](./$RESULTS_DIR/report_assets/quantum_graph_qdrop_progress.png)"
+            } >> report.md
           fi
 
           cml comment create report.md
