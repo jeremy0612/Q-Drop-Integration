@@ -116,7 +116,7 @@ jobs:
 
       - name: Run training — MUTAG & PROTEINS
         env:
-          ALGORITHM: ${{ github.event.inputs.algorithm || 'both' }}
+          ALGORITHM: ${{ github.event.inputs.algorithm || 'pruning' }}
           EPOCHS: ${{ github.event.inputs.epochs || '100' }}
           N_QUBITS: ${{ github.event.inputs.n_qubits || '' }}
 
