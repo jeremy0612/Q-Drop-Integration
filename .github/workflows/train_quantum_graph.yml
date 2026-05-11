@@ -70,17 +70,105 @@ jobs:
     #     run: |
     #       npm install -g @dvcorg/cml
 
+      - name: Check existing dependency stack
+        id: dep_check
+        run: |
+          # Self-hosted runners keep site-packages across jobs. pip treats
+          # 2.7.0+cu126 and 2.7.0+cu128 as both satisfying "torch==2.7.0"
+          # (local version segment ignored), so without an explicit check
+          # the old cu126 wheel can survive and Blackwell sm_120 stays unsupported.
+          #
+          # This step probes the installed stack and emits per-component flags.
+          # Subsequent install steps gate on those flags so a warm runner skips
+          # the slow force-reinstall path entirely.
+          set +e
+          python - <<'PYEOF' > /tmp/dep_check.env
+          import warnings
+
+          def vtuple(s):
+              # "2.7.0+cu128" -> (2, 7, 0); "0.6.12" -> (0, 6, 12)
+              head = s.split("+", 1)[0]
+              parts = []
+              for p in head.split("."):
+                  digits = "".join(c for c in p if c.isdigit())
+                  if not digits:
+                      break
+                  parts.append(int(digits))
+              return tuple(parts)
+
+          want_torch_str = "2.7.0+cu128"
+          flags = {"torch": "reinstall", "pyg": "reinstall",
+                   "pennylane": "reinstall", "training": "reinstall"}
+
+          # torch: full local version match + sm_120 cubin present
+          try:
+              import torch
+              archs = torch.cuda.get_arch_list()
+              has_arch = "sm_120" in archs or "compute_120" in archs
+              if torch.__version__ == want_torch_str and has_arch:
+                  flags["torch"] = "ok"
+          except Exception:
+              pass
+
+          # PyG: import clean of "undefined symbol" ABI warnings
+          try:
+              with warnings.catch_warnings(record=True) as caught:
+                  warnings.simplefilter("always")
+                  import torch_geometric  # noqa: F401
+              abi_break = any("undefined symbol" in str(w.message) for w in caught)
+              if not abi_break:
+                  flags["pyg"] = "ok"
+          except Exception:
+              pass
+
+          # PennyLane 0.38.x + autoray < 0.7
+          try:
+              import pennylane, autoray
+              if pennylane.__version__.startswith("0.38") and \
+                 vtuple(autoray.__version__) < (0, 7):
+                  flags["pennylane"] = "ok"
+          except Exception:
+              pass
+
+          # Training deps: importable + above version floor
+          try:
+              import sklearn, numpy, datasets
+              import matplotlib, tqdm  # noqa: F401
+              if vtuple(sklearn.__version__) >= (1, 3, 0) and \
+                 vtuple(numpy.__version__) >= (1, 24, 0) and \
+                 vtuple(datasets.__version__) >= (2, 18, 0):
+                  flags["training"] = "ok"
+          except Exception:
+              pass
+
+          for k, v in flags.items():
+              print(f"{k}={v}")
+          PYEOF
+          cat /tmp/dep_check.env
+          cat /tmp/dep_check.env >> "$GITHUB_OUTPUT"
+
+      - name: Wipe stale torch stack (only if mismatch)
+        if: steps.dep_check.outputs.torch != 'ok' || steps.dep_check.outputs.pyg != 'ok'
+        run: |
+          pip cache purge || true
+          pip uninstall -y \
+            torch torchvision torchaudio \
+            torch-geometric pyg_lib torch_scatter torch_sparse \
+            torch_cluster torch_spline_conv || true
+
       - name: Install PyTorch (CUDA 12.8, Blackwell sm_120)
+        if: steps.dep_check.outputs.torch != 'ok'
         run: |
           python -m pip install --upgrade pip setuptools wheel
-          pip install torch==2.7.0 --index-url https://download.pytorch.org/whl/cu128
+          pip install --force-reinstall --no-cache-dir \
+            torch==2.7.0 \
+            --index-url https://download.pytorch.org/whl/cu128
 
       - name: Install PyTorch Geometric
+        if: steps.dep_check.outputs.pyg != 'ok' || steps.dep_check.outputs.torch != 'ok'
         run: |
-          # Try matching native ext wheels first (pyg_lib etc.).
-          # If unavailable for torch-2.7.0+cu128, fall back to torch-geometric
-          # alone, which uses torch-native scatter/sparse (slower but works).
-          pip install \
+          # Native ext wheels often lag behind torch+cu128. Try first, accept fallback.
+          pip install --force-reinstall --no-cache-dir \
             pyg_lib \
             torch_scatter \
             torch_sparse \
@@ -88,14 +176,20 @@ jobs:
             torch_spline_conv \
             -f https://data.pyg.org/whl/torch-2.7.0+cu128.html || \
             echo "PyG native ext wheels not available for torch-2.7.0+cu128, skipping"
-          pip install torch-geometric
+          pip install --force-reinstall --no-cache-dir torch-geometric
 
-      - name: Install training dependencies
+      - name: Install PennyLane stack
+        if: steps.dep_check.outputs.pennylane != 'ok' || steps.dep_check.outputs.torch != 'ok'
         run: |
-          pip install \
+          pip install --force-reinstall --no-cache-dir \
             "autoray<0.7" \
             "pennylane==0.38.0" \
-            "pennylane-lightning==0.38.0" \
+            "pennylane-lightning==0.38.0"
+
+      - name: Install training dependencies
+        if: steps.dep_check.outputs.training != 'ok'
+        run: |
+          pip install \
             "scikit-learn>=1.3.0" \
             "numpy>=1.24.0" \
             "matplotlib>=3.7.0" \
