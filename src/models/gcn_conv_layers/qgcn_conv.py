@@ -1,3 +1,5 @@
+import math
+
 import torch
 from torch.nn import Linear, Parameter
 from torch_geometric.nn import MessagePassing
@@ -66,6 +68,13 @@ class QGCNConv(MessagePassing):
             x_reduced = self.feature_reduction(x)
         else:
             x_reduced = x
+
+        # Bound quantum-circuit input to a well-defined angle range so
+        # BasicEntanglerLayers rotations stay within [-pi, pi] regardless of
+        # the upstream feature scale. Unbounded inputs wrap the rotation
+        # angles and turn the quantum gradient surface chaotic, which shows
+        # up downstream as simultaneous gradient spikes and underfitting.
+        x_reduced = torch.tanh(x_reduced) * math.pi
 
         # Step 3: Apply quantum circuit
         q_out = self.quantum_layer(x_reduced).float()

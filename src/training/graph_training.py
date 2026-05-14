@@ -606,16 +606,41 @@ def config_from_args(args: argparse.Namespace) -> GraphTrainConfig:
     )
 
 
+def select_cuda_device(preferred_index: int = 1) -> torch.device:
+    """Pick a CUDA device, preferring ``preferred_index`` when available.
+
+    The Q-Drop training rigs ship with dual RTX PRO 6000 cards. GPU 0 is
+    usually shared with display / Isaac Sim, so the trainer prefers GPU 1
+    when it exists and is visible. Falls back to GPU 0, then CPU, so the
+    same code path runs on single-GPU dev boxes and CI runners without
+    changes. Respects ``CUDA_VISIBLE_DEVICES``: if the operator pinned a
+    single device, ``torch.cuda.device_count()`` already reports 1 and we
+    quietly use the only visible card.
+    """
+    if not torch.cuda.is_available():
+        return torch.device("cpu")
+    device_count = torch.cuda.device_count()
+    if device_count > preferred_index:
+        return torch.device(f"cuda:{preferred_index}")
+    return torch.device("cuda:0")
+
+
 def run_experiments(config: GraphTrainConfig) -> Tuple[Path, Dict[str, Dict]]:
     set_seed(config.seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = select_cuda_device(preferred_index=1)
+    if device.type == "cuda":
+        torch.cuda.set_device(device)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     base_output = Path(config.output_dir) / f"quantum_graph_training_{timestamp}"
     base_output.mkdir(parents=True, exist_ok=True)
 
     print("Unified quantum training started")
-    print(f"Device: {device}")
+    if device.type == "cuda":
+        gpu_name = torch.cuda.get_device_name(device)
+        print(f"Device: {device} ({gpu_name})")
+    else:
+        print(f"Device: {device}")
     print(f"Datasets: {[dataset.upper() for dataset in config.datasets]}")
     print(f"Algorithm: {config.algorithm}")
     print(f"Output: {base_output.resolve()}")
