@@ -51,6 +51,16 @@ on:
         required: false
         default: "16"
 
+# Reusable workflow jobs inherit the caller's permissions, capped at the
+# caller's grant. The default caller-grant for reusable workflows is
+# read-only, which collides with the nested job that needs
+# ``contents: write`` (baseline updates) and ``pull-requests: write``
+# (CML comment posting). Granting them here propagates the same level
+# into the reusable workflow.
+permissions:
+  contents: write
+  pull-requests: write
+
 jobs:
   train-pruning:
     name: Train (pruning, A6000)
