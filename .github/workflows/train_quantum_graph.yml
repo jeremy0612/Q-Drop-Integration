@@ -751,43 +751,46 @@ jobs:
                   "> No baseline found; this run will become the baseline after merge to `main`.",
               ]
 
-          lines += [
-              "",
-              "## Visualizations",
-              "",
-              "The charts below summarize cross-dataset performance, best-fold learning curves, and Q-Drop progress for each dataset.",
-          ]
+          # Visualization listing is appended by the surrounding shell block
+          # because the chart filenames have to come from `RESULTS_DIR` after
+          # the Python heredoc finishes. We deliberately do not inline any
+          # chart references here so that CML never tries to auto-publish
+          # local assets through its broken upload backend.
 
           with open("report.md", "w", encoding="utf-8") as report_file:
               report_file.write("\n".join(lines) + "\n")
           PYEOF
 
-          # cml publish is deprecated; cml comment create now auto-uploads
-          # local assets referenced via inline ![alt](./path) markdown.
-          if [ -f "$RESULTS_DIR/report_assets/quantum_graph_overview.png" ]; then
-            {
-              echo ""
-              echo "### Performance Overview"
-              echo ""
-              echo "![Performance Overview](./$RESULTS_DIR/report_assets/quantum_graph_overview.png)"
-            } >> report.md
-          fi
+          # NOTE: We intentionally do not embed inline image references in the
+          # comment body. CML's asset-upload backend (cml.dev) currently
+          # returns HTTP 400 from Cloudflare, which crashes `cml comment
+          # create` whenever it walks the markdown and tries to upload a
+          # local PNG via `publishLocalFiles` -> `CML.publish`.
+          #
+          # Instead, list which charts were generated and link to the
+          # workflow run page; the PNGs are already uploaded as a GitHub
+          # Actions artifact in the next step ("Upload training artifacts").
+          run_url="https://github.com/${GITHUB_REPOSITORY}/actions/runs/${GITHUB_RUN_ID}"
+          chart_lines=""
+          for chart in \
+              "Performance Overview:quantum_graph_overview.png" \
+              "Best-Fold Learning Curves:quantum_graph_learning_curves.png" \
+              "Q-Drop Progress:quantum_graph_qdrop_progress.png"; do
+            label="${chart%%:*}"
+            filename="${chart##*:}"
+            if [ -f "$RESULTS_DIR/report_assets/$filename" ]; then
+              chart_lines+="- ${label} (\`${filename}\`)"$'\n'
+            fi
+          done
 
-          if [ -f "$RESULTS_DIR/report_assets/quantum_graph_learning_curves.png" ]; then
+          if [ -n "$chart_lines" ]; then
             {
               echo ""
-              echo "### Best-Fold Learning Curves"
+              echo "### Visualizations"
               echo ""
-              echo "![Best-Fold Learning Curves](./$RESULTS_DIR/report_assets/quantum_graph_learning_curves.png)"
-            } >> report.md
-          fi
-
-          if [ -f "$RESULTS_DIR/report_assets/quantum_graph_qdrop_progress.png" ]; then
-            {
+              echo "Generated charts (download from the [workflow artifact](${run_url})):"
               echo ""
-              echo "### Q-Drop Progress"
-              echo ""
-              echo "![Q-Drop Progress](./$RESULTS_DIR/report_assets/quantum_graph_qdrop_progress.png)"
+              echo "$chart_lines"
             } >> report.md
           fi
 
