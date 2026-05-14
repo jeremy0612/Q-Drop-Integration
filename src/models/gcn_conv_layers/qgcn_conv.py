@@ -1,7 +1,7 @@
 import math
 
 import torch
-from torch.nn import Linear, Parameter
+from torch.nn import LayerNorm, Linear, Parameter
 from torch_geometric.nn import MessagePassing
 from torch_geometric.utils import add_self_loops, degree
 
@@ -45,7 +45,16 @@ class QGCNConv(MessagePassing):
             self.feature_reduction = Linear(in_channels, n_qubits, bias=False)
         else:
             self.feature_reduction = None
-        
+
+        # LayerNorm before the tanh*pi bound. The pre-tanh logits drift in
+        # scale across epochs (especially when Q-Drop masks reshape the
+        # effective circuit), so tanh oscillates between linear and
+        # saturated regimes and the quantum input distribution becomes
+        # non-stationary. Normalizing across the qubit axis stabilizes the
+        # angle distribution fed into BasicEntanglerLayers without changing
+        # tensor shape.
+        self.input_norm = LayerNorm(n_qubits)
+
         self.quantum_layer = quantum_net(self.n_qubits, self.n_layers)
         self.qc = self.quantum_layer
         self.bias = Parameter(torch.empty(n_qubits))
@@ -55,6 +64,7 @@ class QGCNConv(MessagePassing):
         self.bias.data.zero_()
         if self.feature_reduction is not None:
             self.feature_reduction.reset_parameters()
+        self.input_norm.reset_parameters()
 
     def forward(self, x, edge_index):
         # x has shape [N, in_channels]
@@ -68,6 +78,11 @@ class QGCNConv(MessagePassing):
             x_reduced = self.feature_reduction(x)
         else:
             x_reduced = x
+
+        # Stabilize the quantum input distribution before bounding it.
+        # LayerNorm centers and scales per-node across the qubit axis so
+        # tanh stays in its informative range epoch-to-epoch.
+        x_reduced = self.input_norm(x_reduced)
 
         # Bound quantum-circuit input to a well-defined angle range so
         # BasicEntanglerLayers rotations stay within [-pi, pi] regardless of
