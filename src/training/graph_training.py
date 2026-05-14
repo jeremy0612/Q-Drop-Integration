@@ -82,6 +82,7 @@ class GraphTrainConfig:
     enable_forward_mask: bool = True
     output_dir: str = "training_results"
     seed: int = 42
+    quantum_lr_scale: float = 0.1
 
 
 class EarlyStopping:
@@ -172,10 +173,49 @@ def build_model(input_dims: int, config: GraphTrainConfig) -> nn.Module:
     )
 
 
+def split_quantum_classical_params(
+    model: nn.Module,
+) -> Tuple[List[nn.Parameter], List[nn.Parameter]]:
+    """Separate the trainable quantum-circuit weights from classical params.
+
+    PennyLane's ``TorchLayer`` registers its rotation angles as
+    ``quantum_layer.weights`` inside ``QuantumCircuitAdapter`` instances.
+    Those tensors are tiny (n_layers x n_qubits = 16 scalars by default)
+    and live on a much noisier loss surface than the surrounding Linear
+    layers because every Q-Drop pruning step masks a fraction of their
+    gradient. Splitting them into their own optimizer group lets the
+    trainer dial in a lower learning rate without slowing the classical
+    encoder / classifier.
+    """
+    quantum_params: List[nn.Parameter] = []
+    classical_params: List[nn.Parameter] = []
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        if "quantum_layer.weights" in name or name.endswith(".quantum_layer.weights"):
+            quantum_params.append(parameter)
+        else:
+            classical_params.append(parameter)
+    return quantum_params, classical_params
+
+
 def build_optimizer(model: nn.Module, config: GraphTrainConfig) -> optim.Optimizer:
+    quantum_params, classical_params = split_quantum_classical_params(model)
+    quantum_lr = config.lr * float(config.quantum_lr_scale)
+
+    if quantum_params:
+        param_groups: List[Dict] = [
+            {"params": classical_params, "lr": config.lr, "name": "classical"},
+            {"params": quantum_params, "lr": quantum_lr, "name": "quantum"},
+        ]
+    else:
+        param_groups = [
+            {"params": classical_params, "lr": config.lr, "name": "classical"},
+        ]
+
     if config.weight_decay > 0:
-        return optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
-    return optim.Adam(model.parameters(), lr=config.lr)
+        return optim.AdamW(param_groups, lr=config.lr, weight_decay=config.weight_decay)
+    return optim.Adam(param_groups, lr=config.lr)
 
 
 def build_qdrop_manager(model: nn.Module, config: GraphTrainConfig):
@@ -325,9 +365,20 @@ def train_fold(
     scheduler = None
     if config.use_scheduler:
         total_steps = max(len(train_loader) * config.epochs, 1)
+        # OneCycleLR rescales every parameter group to the same ``max_lr``
+        # unless we hand it a list. With per-group quantum/classical learning
+        # rates we have to keep the quantum branch on the lower ramp so the
+        # smaller, noisier quantum gradient sees a proportionally smaller
+        # peak step.
+        classical_max_lr = config.lr * 5.0
+        max_lr_per_group = [
+            classical_max_lr if group.get("name") != "quantum"
+            else classical_max_lr * float(config.quantum_lr_scale)
+            for group in optimizer.param_groups
+        ]
         scheduler = OneCycleLR(
             optimizer,
-            max_lr=config.lr * 5.0,
+            max_lr=max_lr_per_group,
             total_steps=total_steps,
             pct_start=0.1,
             anneal_strategy="cos",
@@ -458,6 +509,7 @@ def serialize_result_payload(
             "dropout_prob": config.dropout_prob,
             "n_drop_wires": config.n_drop_wires,
             "enable_forward_mask": config.enable_forward_mask,
+            "quantum_lr_scale": config.quantum_lr_scale,
             "seed": config.seed,
         },
         "summary": aggregate_fold_results(fold_results),
@@ -573,6 +625,12 @@ def build_train_parser(
     parser.add_argument("--drop-prob", type=float, default=0.5)
     parser.add_argument("--n-drop-wires", type=int, default=1)
     parser.add_argument("--disable-forward-mask", action="store_true")
+    parser.add_argument(
+        "--quantum-lr-scale",
+        type=float,
+        default=0.1,
+        help="Multiplier applied to --lr for the quantum parameter group (default 0.1)",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output-dir", type=str, default=default_output_dir)
     return parser
@@ -601,6 +659,7 @@ def config_from_args(args: argparse.Namespace) -> GraphTrainConfig:
         dropout_prob=args.drop_prob,
         n_drop_wires=args.n_drop_wires,
         enable_forward_mask=not args.disable_forward_mask,
+        quantum_lr_scale=args.quantum_lr_scale,
         output_dir=args.output_dir,
         seed=args.seed,
     )
