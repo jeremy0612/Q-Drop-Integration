@@ -2,16 +2,16 @@ name: Quantum Graph Training — MUTAG & PROTEINS
 
 # Orchestration plan:
 #
-#   train-pruning   (A6000)  ──┐
-#                              ├──► train-both   (A6000, algorithm=both)
-#   train-dropout   (P6000)  ──┤
-#         │                     │
-#         └──► report-dropout (A6000, posts CML comment for the P6000 run)
+#   train-pruning   (A6000) ──► report-pruning (A6000)
+#   train-dropout   (P6000) ──► report-dropout (A6000)
+#                                      │
+#                                      └──► train-both (P6000, algorithm=both)
+#                                                   │
+#                                                   └──► report-both (A6000)
 #
 # CML asset uploads currently fail from the P6000 runner (Cloudflare 400 on
-# the cml.dev upload endpoint), so the dropout report is generated on a
-# downstream A6000 job that pulls the P6000 training artifact and posts
-# the comment from a machine whose CML endpoint works.
+# the cml.dev upload endpoint), so report posting for P6000-trained jobs is
+# generated on downstream A6000 jobs that pull artifacts and post comments.
 #
 # Each algorithm uses its own sticky CML comment so the three reports
 # (pruning / dropout / both) appear as three independent rolling updates
@@ -71,9 +71,93 @@ jobs:
       runner-labels: '["self-hosted","A6000"]'
       epochs: ${{ github.event.inputs.epochs || '100' }}
       n_qubits: ${{ github.event.inputs.n_qubits || '' }}
-      post-cml-comment: true
+      post-cml-comment: false
       watermark-title: "Q-Drop training — pruning"
       artifact-suffix: pruning
+
+  report-pruning:
+    name: Report (pruning, A6000)
+    needs: train-pruning
+    runs-on: [self-hosted, A6000]
+    if: always() && needs.train-pruning.result == 'success'
+    permissions:
+      # On `push` events CML targets commit comments
+      # (`POST /repos/{owner}/{repo}/commits/{sha}/comments`),
+      # which needs write-level contents scope.
+      contents: write
+      pull-requests: write
+    env:
+      ALGORITHM: pruning
+      WATERMARK_TITLE: "Q-Drop training — pruning"
+      OUTPUT_DIR: ci_results
+      MPLCONFIGDIR: /tmp/matplotlib
+    steps:
+      - name: Add npm global bin to PATH
+        run: echo "$HOME/.npm-global/bin" >> $GITHUB_PATH
+
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install report-only deps
+        run: |
+          pip install --upgrade pip
+          pip install "matplotlib>=3.7.0" "numpy>=1.24.0"
+
+      - name: Download pruning training artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: quantum-graph-metrics-pruning-${{ github.run_id }}
+          path: artifact-pruning
+
+      - name: Stage results for the report script
+        id: stage
+        run: |
+          mkdir -p "$OUTPUT_DIR"
+          if [ -d artifact-pruning/ci_results ]; then
+            cp -r artifact-pruning/ci_results/* "$OUTPUT_DIR"/
+          else
+            cp -r artifact-pruning/* "$OUTPUT_DIR"/ 2>/dev/null || true
+          fi
+          RESULTS_DIR=$(ls -dt "$OUTPUT_DIR"/quantum_graph_training_* 2>/dev/null | head -1)
+          if [ -z "$RESULTS_DIR" ]; then
+            echo "ERROR: pruning artifact did not contain a quantum_graph_training_* directory"
+            ls -R artifact-pruning
+            exit 1
+          fi
+          echo "RESULTS_DIR=$RESULTS_DIR" >> "$GITHUB_ENV"
+          echo "results-dir=$RESULTS_DIR" >> "$GITHUB_OUTPUT"
+          ls -lah "$RESULTS_DIR"
+
+      - name: Generate CML report (pruning)
+        env:
+          REPORT_INCLUDE_INLINE_ASSETS: "true"
+          REPORT_PATH: report.md
+          BASELINE_PATH: quantum_graph_baseline.json
+        run: |
+          python scripts/generate_cml_report.py
+
+      - name: Post / update CML comment (pruning)
+        env:
+          REPO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cml ci
+          cml comment update --watermark-title="$WATERMARK_TITLE" report.md
+
+      - name: Re-upload pruning report (with charts regenerated on A6000)
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: quantum-graph-metrics-pruning-final-${{ github.run_id }}
+          path: |
+            ${{ steps.stage.outputs.results-dir }}/summary.json
+            ${{ steps.stage.outputs.results-dir }}/report_assets/*.png
+            report.md
+          retention-days: 30
+          if-no-files-found: warn
 
   train-dropout:
     name: Train (dropout, P6000)
@@ -182,15 +266,100 @@ jobs:
           if-no-files-found: warn
 
   train-both:
-    name: Train (both, A6000)
-    needs: [train-pruning, train-dropout]
+    name: Train (both, P6000)
+    needs: [report-pruning, report-dropout]
     uses: ./.github/workflows/_train_quantum_one.yml
     secrets: inherit
     with:
       algorithm: both
-      runner-labels: '["self-hosted","A6000"]'
+      runner-labels: '["self-hosted","P6000"]'
       epochs: ${{ github.event.inputs.epochs || '100' }}
       n_qubits: ${{ github.event.inputs.n_qubits || '' }}
-      post-cml-comment: true
+      # P6000 cannot reach CML's upload backend; report in downstream A6000 job.
+      post-cml-comment: false
       watermark-title: "Q-Drop training — both"
       artifact-suffix: both
+
+  report-both:
+    name: Report (both, A6000)
+    needs: train-both
+    runs-on: [self-hosted, A6000]
+    if: always() && needs.train-both.result == 'success'
+    permissions:
+      # On `push` events CML targets commit comments
+      # (`POST /repos/{owner}/{repo}/commits/{sha}/comments`),
+      # which needs write-level contents scope.
+      contents: write
+      pull-requests: write
+    env:
+      ALGORITHM: both
+      WATERMARK_TITLE: "Q-Drop training — both"
+      OUTPUT_DIR: ci_results
+      MPLCONFIGDIR: /tmp/matplotlib
+    steps:
+      - name: Add npm global bin to PATH
+        run: echo "$HOME/.npm-global/bin" >> $GITHUB_PATH
+
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install report-only deps
+        run: |
+          pip install --upgrade pip
+          pip install "matplotlib>=3.7.0" "numpy>=1.24.0"
+
+      - name: Download both training artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: quantum-graph-metrics-both-${{ github.run_id }}
+          path: artifact-both
+
+      - name: Stage results for the report script
+        id: stage
+        run: |
+          mkdir -p "$OUTPUT_DIR"
+          if [ -d artifact-both/ci_results ]; then
+            cp -r artifact-both/ci_results/* "$OUTPUT_DIR"/
+          else
+            cp -r artifact-both/* "$OUTPUT_DIR"/ 2>/dev/null || true
+          fi
+          RESULTS_DIR=$(ls -dt "$OUTPUT_DIR"/quantum_graph_training_* 2>/dev/null | head -1)
+          if [ -z "$RESULTS_DIR" ]; then
+            echo "ERROR: both artifact did not contain a quantum_graph_training_* directory"
+            ls -R artifact-both
+            exit 1
+          fi
+          echo "RESULTS_DIR=$RESULTS_DIR" >> "$GITHUB_ENV"
+          echo "results-dir=$RESULTS_DIR" >> "$GITHUB_OUTPUT"
+          ls -lah "$RESULTS_DIR"
+
+      - name: Generate CML report (both)
+        env:
+          REPORT_INCLUDE_INLINE_ASSETS: "true"
+          REPORT_PATH: report.md
+          BASELINE_PATH: quantum_graph_baseline.json
+        run: |
+          python scripts/generate_cml_report.py
+
+      - name: Post / update CML comment (both)
+        env:
+          REPO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cml ci
+          cml comment update --watermark-title="$WATERMARK_TITLE" report.md
+
+      - name: Re-upload both report (with charts regenerated on A6000)
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: quantum-graph-metrics-both-final-${{ github.run_id }}
+          path: |
+            ${{ steps.stage.outputs.results-dir }}/summary.json
+            ${{ steps.stage.outputs.results-dir }}/report_assets/*.png
+            report.md
+          retention-days: 30
+          if-no-files-found: warn
