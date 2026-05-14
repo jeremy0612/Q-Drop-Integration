@@ -96,7 +96,10 @@ jobs:
     runs-on: [self-hosted, A6000]
     if: always() && needs.train-dropout.result == 'success'
     permissions:
-      contents: read
+      # On `push` events CML targets commit comments
+      # (`POST /repos/{owner}/{repo}/commits/{sha}/comments`),
+      # which needs write-level contents scope.
+      contents: write
       pull-requests: write
     env:
       ALGORITHM: dropout
