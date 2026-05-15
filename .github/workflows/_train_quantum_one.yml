@@ -226,7 +226,7 @@ jobs:
               --epochs "$EPOCHS" \
               --algorithm "$ALGORITHM" \
               --n-qubits "$N_QUBITS" \
-              --batch-size 32 \
+              --batch-size 16 \
               --prune-window 4 \
               --output-dir "$OUTPUT_DIR" \
               --seed 42
