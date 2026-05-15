@@ -28,7 +28,23 @@ class QuantumCircuitAdapter(nn.Module):
             return [qml.expval(qml.PauliZ(wire_index)) for wire_index in range(n_qubits)]
 
         weight_shapes = {"weights": (n_layers, n_qubits)}
-        self.quantum_layer = qml.qnn.TorchLayer(qnode, weight_shapes)
+
+        # Small-angle initialization for the rotation parameters. Default
+        # PennyLane TorchLayer init is uniform [0, 2*pi], which puts each
+        # parameter near the saturated regime of the expectation-value
+        # landscape and gives a near-flat gradient surface (barren-plateau
+        # neighborhood). Initializing the angles near zero with a small std
+        # places the circuit close to the identity, where gradients are
+        # informative and variance is bounded. See McClean et al. 2018 on
+        # barren plateaus and Grant et al. 2019 on identity-block init.
+        def _small_angle_init(tensor: torch.Tensor) -> torch.Tensor:
+            return torch.nn.init.normal_(tensor, mean=0.0, std=0.1)
+
+        self.quantum_layer = qml.qnn.TorchLayer(
+            qnode,
+            weight_shapes,
+            init_method={"weights": _small_angle_init},
+        )
         self.register_buffer("forward_output_mask", torch.ones(n_qubits, dtype=torch.float32))
 
     @property

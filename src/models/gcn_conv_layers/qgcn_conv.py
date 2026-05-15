@@ -119,6 +119,13 @@ class QGCNConv(MessagePassing):
         # Step 5: Start propagating messages.
         out = self.propagate(edge_index, x=q_out, norm=norm)
 
+        # Residual bypass: classical reduced features carry through, so the
+        # quantum + message-passing stack learns a delta on top of a stable
+        # signal. Damps the variance Q-Drop mask churn injects into the
+        # quantum lane and follows the hybrid-VQC trainability finding
+        # (classical skip improves small-circuit gradients).
+        out = out + x_reduced
+
         # Step 6: Apply a final bias vector.
         out = out + self.bias
 
