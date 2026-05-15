@@ -68,6 +68,19 @@ DATASET_NQUBITS_OVERRIDES: Dict[str, int] = {
 }
 
 
+# Per-dataset batch-size overrides bound to n_qubits overrides. At
+# n_qubits=16 PennyLane default.qubit stores a 2^16-amplitude state per
+# node and (with backprop) every intermediate state in the circuit, so
+# memory scales linearly with (nodes_per_batch * 2^n_qubits * circuit
+# depth). PROTEINS averages ~39 nodes per graph, so batch_size=32 turns
+# into ~1248 nodes per batch and ~80 GB of stored state on a 16-wire
+# circuit, exceeding even an A6000. Dropping to 8 graphs trims memory ~4x
+# while keeping the gradient signal informative.
+DATASET_BATCHSIZE_OVERRIDES: Dict[str, int] = {
+    "proteins": 8,
+}
+
+
 @dataclass
 class GraphTrainConfig:
     datasets: Sequence[str]
@@ -546,10 +559,22 @@ def train_dataset(
     # Apply per-dataset n_qubits override unless the operator pinned a
     # width explicitly via --n-qubits. Keeps reproducibility intact while
     # letting PROTEINS run on a wider circuit than MUTAG.
+    applied_nqubits_override = False
     if config.n_qubits is None and dataset_key in DATASET_NQUBITS_OVERRIDES:
         override = DATASET_NQUBITS_OVERRIDES[dataset_key]
         config = replace(config, n_qubits=override)
+        applied_nqubits_override = True
         print(f"  Per-dataset override: n_qubits -> {override}")
+
+    # When the wider quantum circuit is active, also shrink the graph
+    # batch so the simulator state fits in GPU memory. Only triggers when
+    # we picked the override above, so an explicit --n-qubits run keeps
+    # the operator-chosen batch size.
+    if applied_nqubits_override and dataset_key in DATASET_BATCHSIZE_OVERRIDES:
+        batch_override = DATASET_BATCHSIZE_OVERRIDES[dataset_key]
+        if config.batch_size > batch_override:
+            config = replace(config, batch_size=batch_override)
+            print(f"  Per-dataset override: batch_size -> {batch_override}")
 
     print("\n" + "=" * 72)
     print(f"Training QGCN on {dataset_spec.name}")
