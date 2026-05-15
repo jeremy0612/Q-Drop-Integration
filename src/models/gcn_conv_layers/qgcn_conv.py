@@ -2,6 +2,7 @@ import math
 
 import torch
 from torch.nn import LayerNorm, Linear, Parameter
+from torch.nn.utils.parametrizations import orthogonal as orthogonal_parametrization
 from torch_geometric.nn import MessagePassing
 from torch_geometric.utils import add_self_loops, degree
 
@@ -59,6 +60,20 @@ class QGCNConv(MessagePassing):
         self.qc = self.quantum_layer
         self.bias = Parameter(torch.empty(n_qubits))
         self.reset_parameters()
+
+        # Cayley-parametrized orthogonality on the quantum input projection.
+        # Forces feature_reduction.weight to remain semi-orthogonal across
+        # training, so the projection from in_channels -> n_qubits stays
+        # near-isometric and the angle distribution fed into the quantum
+        # circuit keeps roughly unit-norm energy per direction. Registered
+        # after reset_parameters so the underlying tensor is initialized
+        # first and the parametrization just projects it.
+        if self.feature_reduction is not None:
+            orthogonal_parametrization(
+                self.feature_reduction,
+                name="weight",
+                orthogonal_map="cayley",
+            )
 
     def reset_parameters(self):
         self.bias.data.zero_()

@@ -6,7 +6,7 @@ import argparse
 import json
 import random
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -54,6 +54,17 @@ DATASET_SPECS: Dict[str, GraphDatasetSpec] = {
         source="graphs-datasets/PROTEINS",
         task="binary classification (enzyme vs non-enzyme)",
     ),
+}
+
+
+# Per-dataset quantum-tensor-width overrides. PROTEINS has only 4 node
+# features but ~39 nodes per graph and a wider class boundary than MUTAG,
+# so the default 8-wire bucket leaves the circuit under-expressive while
+# MUTAG (7 features) saturates 8 wires. Forcing PROTEINS to 16 doubles
+# the rotation-angle capacity at the cost of ~2x quantum runtime per
+# QGCNConv call.
+DATASET_NQUBITS_OVERRIDES: Dict[str, int] = {
+    "proteins": 16,
 }
 
 
@@ -531,6 +542,14 @@ def train_dataset(
 ) -> Dict:
     dataset_key = normalize_dataset_name(dataset_name)
     dataset_spec = DATASET_SPECS[dataset_key]
+
+    # Apply per-dataset n_qubits override unless the operator pinned a
+    # width explicitly via --n-qubits. Keeps reproducibility intact while
+    # letting PROTEINS run on a wider circuit than MUTAG.
+    if config.n_qubits is None and dataset_key in DATASET_NQUBITS_OVERRIDES:
+        override = DATASET_NQUBITS_OVERRIDES[dataset_key]
+        config = replace(config, n_qubits=override)
+        print(f"  Per-dataset override: n_qubits -> {override}")
 
     print("\n" + "=" * 72)
     print(f"Training QGCN on {dataset_spec.name}")

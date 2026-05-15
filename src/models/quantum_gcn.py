@@ -1,5 +1,6 @@
 import torch
 from torch.nn import Linear, LeakyReLU, Module, ModuleList
+from torch.nn.init import orthogonal_
 from torch_geometric.nn import global_mean_pool
 
 try:
@@ -49,6 +50,13 @@ class QGCN(Module):
             self.readout = None
 
         self.classifier = Linear(self.n_qubits, output_dims)
+        # Orthogonal initialization on the classifier head. For an
+        # (output_dims, n_qubits) projection this seeds each output logit
+        # with a unit-norm row vector that is orthogonal to the others,
+        # which decorrelates the output channels at the start of training
+        # and reduces the chance one logit dominates while the rest stay
+        # ill-conditioned. One-shot init, no constraint during training.
+        orthogonal_(self.classifier.weight)
 
     def qdrop_layers(self):
         quantum_layers = []
