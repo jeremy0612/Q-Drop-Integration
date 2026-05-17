@@ -4,7 +4,9 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
+import sys
 from collections import Counter
 from dataclasses import dataclass, replace
 from datetime import datetime
@@ -14,6 +16,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from sklearn.metrics import (
     accuracy_score,
@@ -33,6 +36,16 @@ from data.load_mutag import load_mutag
 from data.load_proteins import load_proteins
 from models.quantum_gcn import QGCN
 from qdrop import QDropConfig, QDropRuntimeFactory, TorchQDropRuntime
+
+# Allow importing from the top-level data_loader package that lives two
+# directories above src/training/ (project root → data_loader/).
+_project_root = str(Path(__file__).resolve().parents[2])
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
+
+from data_loader.load_nci1 import load_nci1
+from data_loader.load_imdb_binary import load_imdb_binary
+from data_loader.load_imdb_multi import load_imdb_multi
 
 
 @dataclass(frozen=True)
@@ -54,6 +67,22 @@ DATASET_SPECS: Dict[str, GraphDatasetSpec] = {
         source="graphs-datasets/PROTEINS",
         task="binary classification (enzyme vs non-enzyme)",
     ),
+    "nci1": GraphDatasetSpec(
+        name="NCI1",
+        source="TUDataset/NCI1",
+        task="binary classification (active vs inactive, lung cancer)",
+    ),
+    "imdb_binary": GraphDatasetSpec(
+        name="IMDB-BINARY",
+        source="TUDataset/IMDB-BINARY",
+        task="binary classification (Action vs Romance)",
+    ),
+    "imdb_multi": GraphDatasetSpec(
+        name="IMDB-MULTI",
+        source="TUDataset/IMDB-MULTI",
+        task="3-class classification (Comedy / Romance / Sci-Fi)",
+        n_classes=3,
+    ),
 }
 
 
@@ -65,6 +94,15 @@ DATASET_SPECS: Dict[str, GraphDatasetSpec] = {
 # QGCNConv call.
 DATASET_NQUBITS_OVERRIDES: Dict[str, int] = {
     "proteins": 16,
+    # NCI1 has 37-dim features; without override the bucketing sends it to
+    # 16 qubits (min(37,16)=16, >8 → bucket to 16). Force 8 so the
+    # simulator state per node is 2^8 instead of 2^16, keeping memory sane
+    # for the 4,110-graph dataset.
+    "nci1": 8,
+    # IMDB datasets use degree one-hot features (136 / 89 dims) which
+    # naturally bucket to 16 qubits. Keep 16 for expressiveness.
+    "imdb_binary": 16,
+    "imdb_multi": 16,
 }
 
 
@@ -78,6 +116,9 @@ DATASET_NQUBITS_OVERRIDES: Dict[str, int] = {
 # while keeping the gradient signal informative.
 DATASET_BATCHSIZE_OVERRIDES: Dict[str, int] = {
     "proteins": 8,
+    # 16-qubit circuits need the same memory reduction as PROTEINS.
+    "imdb_binary": 8,
+    "imdb_multi": 8,
 }
 
 
@@ -141,11 +182,17 @@ def load_dataset_by_name(name: str):
         return load_mutag()
     if dataset_name in {"proteins", "protein"}:
         return load_proteins()
+    if dataset_name == "nci1":
+        return load_nci1()
+    if dataset_name in {"imdb_binary", "imdb-binary"}:
+        return load_imdb_binary()
+    if dataset_name in {"imdb_multi", "imdb-multi"}:
+        return load_imdb_multi()
     raise ValueError(f"Unsupported dataset: {name}")
 
 
 def normalize_dataset_name(name: str) -> str:
-    dataset_name = name.lower()
+    dataset_name = name.lower().replace("-", "_")
     if dataset_name == "protein":
         return "proteins"
     return dataset_name
@@ -161,36 +208,53 @@ def compute_class_weight(labels: Sequence[int], device: torch.device) -> torch.T
     return torch.tensor([pos_weight], dtype=torch.float, device=device)
 
 
-def compute_metrics(y_true: List[int], y_pred: List[int], y_prob: List[float]) -> Dict[str, float]:
+def compute_metrics(
+    y_true: List[int],
+    y_pred: List[int],
+    y_prob,
+    n_classes: int = 2,
+) -> Dict[str, float]:
     y_true_np = np.asarray(y_true).reshape(-1)
     y_pred_np = np.asarray(y_pred).reshape(-1)
-    y_prob_np = np.asarray(y_prob).reshape(-1)
 
+    avg = "binary" if n_classes == 2 else "macro"
     metrics = {
         "accuracy": float(accuracy_score(y_true_np, y_pred_np)),
-        "precision": float(precision_score(y_true_np, y_pred_np, zero_division=0)),
-        "recall": float(recall_score(y_true_np, y_pred_np, zero_division=0)),
-        "f1": float(f1_score(y_true_np, y_pred_np, zero_division=0)),
+        "precision": float(precision_score(y_true_np, y_pred_np, average=avg, zero_division=0)),
+        "recall": float(recall_score(y_true_np, y_pred_np, average=avg, zero_division=0)),
+        "f1": float(f1_score(y_true_np, y_pred_np, average=avg, zero_division=0)),
     }
 
-    try:
-        metrics["roc_auc"] = float(roc_auc_score(y_true_np, y_prob_np))
-    except ValueError:
-        metrics["roc_auc"] = 0.0
-
-    try:
-        metrics["pr_auc"] = float(average_precision_score(y_true_np, y_prob_np))
-    except ValueError:
-        metrics["pr_auc"] = 0.0
+    if n_classes == 2:
+        y_prob_np = np.asarray(y_prob).reshape(-1)
+        try:
+            metrics["roc_auc"] = float(roc_auc_score(y_true_np, y_prob_np))
+        except ValueError:
+            metrics["roc_auc"] = 0.0
+        try:
+            metrics["pr_auc"] = float(average_precision_score(y_true_np, y_prob_np))
+        except ValueError:
+            metrics["pr_auc"] = 0.0
+    else:
+        y_prob_np = np.asarray(y_prob)  # (N, n_classes)
+        try:
+            metrics["roc_auc"] = float(
+                roc_auc_score(y_true_np, y_prob_np, multi_class="ovr", average="macro")
+            )
+        except ValueError:
+            metrics["roc_auc"] = 0.0
+        metrics["pr_auc"] = 0.0  # not well-defined for multi-class
 
     return metrics
 
 
-def build_model(input_dims: int, config: GraphTrainConfig) -> nn.Module:
+def build_model(input_dims: int, config: GraphTrainConfig, n_classes: int = 2) -> nn.Module:
+    # Binary uses a single logit + BCEWithLogitsLoss; multi-class uses C logits + CrossEntropyLoss.
+    output_dims = 1 if n_classes == 2 else n_classes
     return QGCN(
         input_dims=input_dims,
         q_depths=list(config.q_depths),
-        output_dims=1,
+        output_dims=output_dims,
         activ_fn=LeakyReLU(0.2),
         readout=False,
         n_qubits=config.n_qubits,
@@ -315,6 +379,7 @@ def run_epoch(
     scheduler: Optional[OneCycleLR] = None,
     grad_clip: float = 1.0,
     qdrop_manager: Optional[TorchQDropRuntime] = None,
+    n_classes: int = 2,
 ) -> Tuple[float, Dict[str, float]]:
     is_train = optimizer is not None
     model.train(is_train)
@@ -328,7 +393,7 @@ def run_epoch(
     total_loss = 0.0
     all_labels: List[int] = []
     all_preds: List[int] = []
-    all_probs: List[float] = []
+    all_probs: List = []
 
     context = torch.enable_grad() if is_train else torch.no_grad()
     with context:
@@ -337,11 +402,21 @@ def run_epoch(
             if is_train:
                 optimizer.zero_grad(set_to_none=True)
             logits = model(batch.x, batch.edge_index, batch.batch)
-            if logits.dim() > 1 and logits.size(1) == 1:
-                logits = logits.squeeze(1)
 
-            target = batch.y.float()
-            loss = criterion(logits, target)
+            if n_classes == 2:
+                if logits.dim() > 1 and logits.size(1) == 1:
+                    logits = logits.squeeze(1)
+                target = batch.y.float()
+                loss = criterion(logits, target)
+                probs = torch.sigmoid(logits)
+                preds = (probs > 0.5).long()
+                batch_probs = probs.detach().cpu().tolist()
+            else:
+                target = batch.y.long()
+                loss = criterion(logits, target)
+                probs = F.softmax(logits, dim=1)
+                preds = torch.argmax(probs, dim=1)
+                batch_probs = probs.detach().cpu().tolist()  # List[List[float]]
 
             if is_train:
                 loss.backward()
@@ -355,15 +430,12 @@ def run_epoch(
                 if scheduler is not None:
                     scheduler.step()
 
-            probs = torch.sigmoid(logits)
-            preds = (probs > 0.5).long()
-
             total_loss += float(loss.item())
             all_labels.extend(target.long().cpu().tolist())
             all_preds.extend(preds.cpu().tolist())
-            all_probs.extend(probs.detach().cpu().tolist())
+            all_probs.extend(batch_probs)
 
-    return total_loss / max(len(loader), 1), compute_metrics(all_labels, all_preds, all_probs)
+    return total_loss / max(len(loader), 1), compute_metrics(all_labels, all_preds, all_probs, n_classes=n_classes)
 
 
 def train_fold(
@@ -373,18 +445,21 @@ def train_fold(
     device: torch.device,
     dataset_name: str,
     fold_idx: int,
+    n_classes: int = 2,
 ) -> Dict:
     train_loader = DataLoader(train_graphs, batch_size=config.batch_size, shuffle=True)
     test_loader = DataLoader(test_graphs, batch_size=config.batch_size, shuffle=False)
 
-    model = build_model(input_dims=train_graphs[0].x.size(1), config=config).to(device)
+    model = build_model(input_dims=train_graphs[0].x.size(1), config=config, n_classes=n_classes).to(device)
 
-    pos_weight = None
-    if config.use_class_weights:
-        labels = [int(graph.y.item()) for graph in train_graphs]
-        pos_weight = compute_class_weight(labels, device=device)
-
-    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    if n_classes == 2:
+        pos_weight = None
+        if config.use_class_weights:
+            labels = [int(graph.y.item()) for graph in train_graphs]
+            pos_weight = compute_class_weight(labels, device=device)
+        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    else:
+        criterion = nn.CrossEntropyLoss()
     optimizer = build_optimizer(model, config)
     scheduler = None
     if config.use_scheduler:
@@ -436,6 +511,7 @@ def train_fold(
             scheduler=scheduler,
             grad_clip=config.grad_clip,
             qdrop_manager=qdrop_manager,
+            n_classes=n_classes,
         )
         train_curve.append({"epoch": epoch, "loss": train_loss, **train_metrics})
 
@@ -452,6 +528,7 @@ def train_fold(
             criterion=criterion,
             device=device,
             qdrop_manager=qdrop_manager,
+            n_classes=n_classes,
         )
         val_curve.append({"epoch": epoch, "loss": val_loss, **val_metrics})
 
@@ -475,6 +552,7 @@ def train_fold(
         criterion=criterion,
         device=device,
         qdrop_manager=qdrop_manager,
+        n_classes=n_classes,
     )
     print(
         f"    Fold {fold_idx + 1} test: "
@@ -590,6 +668,7 @@ def train_dataset(
     splitter = StratifiedKFold(n_splits=config.n_folds, shuffle=True, random_state=config.seed)
     fold_results: List[Dict] = []
 
+    n_classes = dataset_spec.n_classes
     for fold_idx, (train_idx, test_idx) in enumerate(splitter.split(graphs, labels)):
         train_graphs = [graphs[index] for index in train_idx]
         test_graphs = [graphs[index] for index in test_idx]
@@ -601,6 +680,7 @@ def train_dataset(
                 device=device,
                 dataset_name=dataset_spec.name,
                 fold_idx=fold_idx,
+                n_classes=n_classes,
             )
         )
 
