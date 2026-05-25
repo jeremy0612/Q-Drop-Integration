@@ -1,7 +1,8 @@
 import torch
-from torch.nn import Linear, LeakyReLU, Module, ModuleList
+import torch.nn as nn
+from torch.nn import LayerNorm, Dropout, LeakyReLU, Linear, Module, ModuleList, ReLU, Sequential
 from torch.nn.init import orthogonal_
-from torch_geometric.nn import global_mean_pool
+from torch_geometric.nn import global_add_pool, global_max_pool, global_mean_pool
 
 try:
     from .gcn_conv_layers import QGCNConv
@@ -10,7 +11,7 @@ except ImportError:
 
 
 class QGCN(Module):
-    """QGCN with Linear classifier only."""
+    """QGCN with optional multi-scale pooling, MLP head, and residual connections."""
 
     def __init__(
         self,
@@ -21,9 +22,14 @@ class QGCN(Module):
         classifier=None,
         readout=False,
         n_qubits=None,
+        pool_type="mean",
+        use_mlp_head=False,
+        mlp_hidden=64,
+        mlp_dropout=0.5,
+        use_residual=False,
+        use_strongly_entangling=False,
     ):
         super().__init__()
-        layers = []
         max_qubits = 16
         if n_qubits is None:
             n_qubits = min(input_dims, max_qubits)
@@ -35,11 +41,17 @@ class QGCN(Module):
         else:
             n_qubits = 8
         self.n_qubits = n_qubits
+        self.pool_type = pool_type
+        self.use_residual = use_residual
 
+        layers = []
         for index, q_depth in enumerate(q_depths):
             layer_input_dims = input_dims if index == 0 else n_qubits
-            qgcn_conv = QGCNConv(layer_input_dims, q_depth, n_qubits=n_qubits)
-            layers.append(qgcn_conv)
+            layers.append(QGCNConv(
+                layer_input_dims, q_depth,
+                n_qubits=n_qubits,
+                use_strongly_entangling=use_strongly_entangling,
+            ))
 
         self.layers = ModuleList(layers)
         self.activ_fn = activ_fn
@@ -49,14 +61,25 @@ class QGCN(Module):
         else:
             self.readout = None
 
-        self.classifier = Linear(self.n_qubits, output_dims)
-        # Orthogonal initialization on the classifier head. For an
-        # (output_dims, n_qubits) projection this seeds each output logit
-        # with a unit-norm row vector that is orthogonal to the others,
-        # which decorrelates the output channels at the start of training
-        # and reduces the chance one logit dominates while the rest stay
-        # ill-conditioned. One-shot init, no constraint during training.
-        orthogonal_(self.classifier.weight)
+        pool_factor = 3 if pool_type == "multiscale" else 1
+        pool_out_dims = n_qubits * pool_factor
+
+        if use_mlp_head:
+            half_hidden = max(mlp_hidden // 2, output_dims)
+            self.classifier = Sequential(
+                Linear(pool_out_dims, mlp_hidden),
+                LayerNorm(mlp_hidden),
+                ReLU(),
+                Dropout(mlp_dropout),
+                Linear(mlp_hidden, half_hidden),
+                LayerNorm(half_hidden),
+                ReLU(),
+                Dropout(mlp_dropout * 0.5),
+                Linear(half_hidden, output_dims),
+            )
+        else:
+            self.classifier = Linear(pool_out_dims, output_dims)
+            orthogonal_(self.classifier.weight)
 
     def qdrop_layers(self):
         quantum_layers = []
@@ -70,11 +93,22 @@ class QGCN(Module):
 
     def forward(self, x, edge_index, batch):
         h = x
-        for layer in self.layers:
-            h = layer(h, edge_index)
-            h = self.activ_fn(h)
+        for idx, layer in enumerate(self.layers):
+            h_new = layer(h, edge_index)
+            h_new = self.activ_fn(h_new)
+            if self.use_residual and idx > 0:
+                h = h + h_new
+            else:
+                h = h_new
 
-        h = global_mean_pool(h, batch)
+        if self.pool_type == "multiscale":
+            h_mean = global_mean_pool(h, batch)
+            h_max = global_max_pool(h, batch)
+            h_add = global_add_pool(h, batch)
+            h = torch.cat([h_mean, h_max, h_add], dim=1)
+        else:
+            h = global_mean_pool(h, batch)
+
         h = self.classifier(h)
 
         if self.readout is not None:

@@ -23,21 +23,31 @@ def _select_device_and_diff(n_qubits: int):
 class QuantumCircuitAdapter(nn.Module):
     """Own a PennyLane TorchLayer and expose lazy Q-Drop specs for it."""
 
-    def __init__(self, n_qubits: int, n_layers: int):
+    def __init__(self, n_qubits: int, n_layers: int, use_strongly_entangling: bool = False):
         super().__init__()
         self.n_qubits = n_qubits
         self.n_layers = n_layers
+        self.use_strongly_entangling = use_strongly_entangling
         self.qdrop_name = self.__class__.__name__
 
         device, diff_method = _select_device_and_diff(n_qubits)
 
-        @qml.qnode(device, interface="torch", diff_method=diff_method)
-        def qnode(inputs, weights):
-            qml.templates.AngleEmbedding(inputs, wires=range(n_qubits))
-            qml.templates.BasicEntanglerLayers(weights, wires=range(n_qubits))
-            return [qml.expval(qml.PauliZ(wire_index)) for wire_index in range(n_qubits)]
+        if use_strongly_entangling:
+            @qml.qnode(device, interface="torch", diff_method=diff_method)
+            def qnode(inputs, weights):
+                qml.templates.AngleEmbedding(inputs, wires=range(n_qubits))
+                qml.templates.StronglyEntanglingLayers(weights, wires=range(n_qubits))
+                return [qml.expval(qml.PauliZ(wire_index)) for wire_index in range(n_qubits)]
 
-        weight_shapes = {"weights": (n_layers, n_qubits)}
+            weight_shapes = {"weights": (n_layers, n_qubits, 3)}
+        else:
+            @qml.qnode(device, interface="torch", diff_method=diff_method)
+            def qnode(inputs, weights):
+                qml.templates.AngleEmbedding(inputs, wires=range(n_qubits))
+                qml.templates.BasicEntanglerLayers(weights, wires=range(n_qubits))
+                return [qml.expval(qml.PauliZ(wire_index)) for wire_index in range(n_qubits)]
+
+            weight_shapes = {"weights": (n_layers, n_qubits)}
 
         self.quantum_layer = qml.qnn.TorchLayer(qnode, weight_shapes)
         self.register_buffer("forward_output_mask", torch.ones(n_qubits, dtype=torch.float32))
@@ -48,10 +58,16 @@ class QuantumCircuitAdapter(nn.Module):
         return self.quantum_layer.weights
 
     def mask_builder(self, wire_ids):
-        mask = torch.zeros(self.n_layers, self.n_qubits, dtype=torch.bool, device=self.weights.device)
-        for wire_index in wire_ids:
-            if 0 <= wire_index < self.n_qubits:
-                mask[:, wire_index] = True
+        if self.use_strongly_entangling:
+            mask = torch.zeros(self.n_layers, self.n_qubits, 3, dtype=torch.bool, device=self.weights.device)
+            for wire_index in wire_ids:
+                if 0 <= wire_index < self.n_qubits:
+                    mask[:, wire_index, :] = True
+        else:
+            mask = torch.zeros(self.n_layers, self.n_qubits, dtype=torch.bool, device=self.weights.device)
+            for wire_index in wire_ids:
+                if 0 <= wire_index < self.n_qubits:
+                    mask[:, wire_index] = True
         return mask
 
     def set_forward_mask(self, dropout_state: QDropDropoutState | None) -> None:

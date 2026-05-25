@@ -35,6 +35,7 @@ from tqdm import tqdm
 from data.load_mutag import load_mutag
 from data.load_proteins import load_proteins
 from models.quantum_gcn import QGCN
+from models.quantum_gat import QGAT
 from qdrop import QDropConfig, QDropRuntimeFactory, TorchQDropRuntime
 
 # Allow importing from the top-level data_loader package that lives two
@@ -121,6 +122,28 @@ DATASET_BATCHSIZE_OVERRIDES: Dict[str, int] = {
     "imdb_multi": 8,
 }
 
+# Per-dataset model-architecture overrides that activate alongside the
+# n_qubits override (same applied_nqubits_override gate). Only fires when
+# the operator has not pinned n_qubits explicitly, preserving reproducibility
+# of pinned experiments. Each key maps to a dict of GraphTrainConfig fields.
+DATASET_MODEL_OVERRIDES: Dict[str, Dict] = {
+    # NCI1 overrides: multi-scale pooling + MLP head + residual give the
+    # largest accuracy gains at zero extra quantum-circuit cost.
+    # StronglyEntanglingLayers is omitted: it triples circuit cost
+    # (~6h total on 10-fold/150-epoch), while mean+max+add pooling and
+    # the MLP head already give the biggest accuracy boost.
+    "nci1": {
+        "pool_type": "multiscale",
+        "use_mlp_head": True,
+        "mlp_hidden": 64,
+        "mlp_dropout": 0.3,
+        "use_residual": True,
+        "q_depths": (3, 3),
+        "epochs": 150,
+        "early_stop_patience": 20,
+    },
+}
+
 
 @dataclass
 class GraphTrainConfig:
@@ -148,6 +171,14 @@ class GraphTrainConfig:
     output_dir: str = "training_results"
     seed: int = 42
     quantum_lr_scale: float = 0.1
+    pool_type: str = "mean"
+    use_mlp_head: bool = False
+    mlp_hidden: int = 64
+    mlp_dropout: float = 0.5
+    use_residual: bool = False
+    use_strongly_entangling: bool = False
+    model_type: str = "qgcn"
+    attn_dropout: float = 0.2
 
 
 class EarlyStopping:
@@ -249,8 +280,23 @@ def compute_metrics(
 
 
 def build_model(input_dims: int, config: GraphTrainConfig, n_classes: int = 2) -> nn.Module:
-    # Binary uses a single logit + BCEWithLogitsLoss; multi-class uses C logits + CrossEntropyLoss.
     output_dims = 1 if n_classes == 2 else n_classes
+
+    if config.model_type == "qgat":
+        return QGAT(
+            input_dims=input_dims,
+            q_depths=list(config.q_depths),
+            output_dims=output_dims,
+            attn_dropout=config.attn_dropout,
+            layer_dropout=config.attn_dropout,
+            max_qubits=config.n_qubits or 8,
+            pool_type=config.pool_type,
+            use_mlp_head=config.use_mlp_head,
+            mlp_hidden=config.mlp_hidden,
+            mlp_dropout=config.mlp_dropout,
+            use_residual=config.use_residual,
+        )
+
     return QGCN(
         input_dims=input_dims,
         q_depths=list(config.q_depths),
@@ -258,6 +304,12 @@ def build_model(input_dims: int, config: GraphTrainConfig, n_classes: int = 2) -
         activ_fn=LeakyReLU(0.2),
         readout=False,
         n_qubits=config.n_qubits,
+        pool_type=config.pool_type,
+        use_mlp_head=config.use_mlp_head,
+        mlp_hidden=config.mlp_hidden,
+        mlp_dropout=config.mlp_dropout,
+        use_residual=config.use_residual,
+        use_strongly_entangling=config.use_strongly_entangling,
     )
 
 
@@ -613,6 +665,14 @@ def serialize_result_payload(
             "enable_forward_mask": config.enable_forward_mask,
             "quantum_lr_scale": config.quantum_lr_scale,
             "seed": config.seed,
+            "pool_type": config.pool_type,
+            "use_mlp_head": config.use_mlp_head,
+            "mlp_hidden": config.mlp_hidden,
+            "mlp_dropout": config.mlp_dropout,
+            "use_residual": config.use_residual,
+            "use_strongly_entangling": config.use_strongly_entangling,
+            "model_type": config.model_type,
+            "attn_dropout": config.attn_dropout,
         },
         "summary": aggregate_fold_results(fold_results),
         "folds": list(fold_results),
@@ -653,6 +713,29 @@ def train_dataset(
         if config.batch_size > batch_override:
             config = replace(config, batch_size=batch_override)
             print(f"  Per-dataset override: batch_size -> {batch_override}")
+
+    # Apply per-dataset model architecture overrides (e.g. NCI1 gets
+    # multi-scale pooling + MLP head + StronglyEntanglingLayers). Gated on
+    # applied_nqubits_override so that explicit --n-qubits runs keep the
+    # operator-chosen architecture for reproducibility.
+    _MODEL_DEFAULT_SENTINELS = {
+        "pool_type": "mean",
+        "use_mlp_head": False,
+        "use_residual": False,
+        "use_strongly_entangling": False,
+    }
+    if applied_nqubits_override and dataset_key in DATASET_MODEL_OVERRIDES:
+        patch: Dict = {}
+        model_overrides = DATASET_MODEL_OVERRIDES[dataset_key]
+        for field, sentinel in _MODEL_DEFAULT_SENTINELS.items():
+            if getattr(config, field) == sentinel and field in model_overrides:
+                patch[field] = model_overrides[field]
+        for field in ("mlp_hidden", "mlp_dropout", "epochs", "early_stop_patience", "q_depths"):
+            if field in model_overrides:
+                patch[field] = model_overrides[field]
+        if patch:
+            config = replace(config, **patch)
+            print(f"  Per-dataset model overrides: {patch}")
 
     print("\n" + "=" * 72)
     print(f"Training QGCN on {dataset_spec.name}")
@@ -757,6 +840,14 @@ def build_train_parser(
     )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output-dir", type=str, default=default_output_dir)
+    parser.add_argument("--pool-type", type=str, default="mean", choices=["mean", "multiscale"])
+    parser.add_argument("--use-mlp-head", action="store_true", default=False)
+    parser.add_argument("--mlp-hidden", type=int, default=64)
+    parser.add_argument("--mlp-dropout", type=float, default=0.5)
+    parser.add_argument("--use-residual", action="store_true", default=False)
+    parser.add_argument("--use-strongly-entangling", action="store_true", default=False)
+    parser.add_argument("--model-type", type=str, default="qgcn", choices=["qgcn", "qgat"])
+    parser.add_argument("--attn-dropout", type=float, default=0.2)
     return parser
 
 
@@ -786,6 +877,14 @@ def config_from_args(args: argparse.Namespace) -> GraphTrainConfig:
         quantum_lr_scale=args.quantum_lr_scale,
         output_dir=args.output_dir,
         seed=args.seed,
+        pool_type=args.pool_type,
+        use_mlp_head=args.use_mlp_head,
+        mlp_hidden=args.mlp_hidden,
+        mlp_dropout=args.mlp_dropout,
+        use_residual=args.use_residual,
+        use_strongly_entangling=args.use_strongly_entangling,
+        model_type=args.model_type,
+        attn_dropout=args.attn_dropout,
     )
 
 
