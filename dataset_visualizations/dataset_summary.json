@@ -28,5 +28,20 @@
     "density_mean": 0.21217560910427083,
     "density_std": 0.19798650141763133,
     "figure": "dataset_visualizations/proteins_dataset_visualization.png"
+  },
+  "imdb_binary": {
+    "n_graphs": 1000,
+    "feature_dim": 136,
+    "class_counts": {
+      "0": 500,
+      "1": 500
+    },
+    "nodes_mean": 19.773,
+    "nodes_std": 10.055320531937308,
+    "edges_mean": 96.531,
+    "edges_std": 105.6003268886986,
+    "density_mean": 0.5206179238965234,
+    "density_std": 0.24340317891264188,
+    "figure": "dataset_visualizations/imdb_binary_dataset_visualization.png"
   }
 }

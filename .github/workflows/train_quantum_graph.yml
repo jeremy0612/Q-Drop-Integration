@@ -1,5 +1,22 @@
 name: Quantum Graph Training — MUTAG & PROTEINS
 
+# Orchestration plan:
+#
+#   train-pruning   (A6000) ──► report-pruning (A6000)
+#   train-dropout   (P6000) ──► report-dropout (A6000)
+#                                      │
+#                                      └──► train-both (P6000, algorithm=both)
+#                                                   │
+#                                                   └──► report-both (A6000)
+#
+# CML asset uploads currently fail from the P6000 runner (Cloudflare 400 on
+# the cml.dev upload endpoint), so report posting for P6000-trained jobs is
+# generated on downstream A6000 jobs that pull artifacts and post comments.
+#
+# Each algorithm uses its own sticky CML comment so the three reports
+# (pruning / dropout / both) appear as three independent rolling updates
+# rather than overwriting each other.
+
 on:
   push:
     branches: [feat/torch_qdrop]
@@ -9,7 +26,9 @@ on:
       - "src/training/**"
       - "src/data/**"
       - "src/train_quantum_models.py"
+      - "scripts/generate_cml_report.py"
       - ".github/workflows/train_quantum_graph.yml"
+      - ".github/workflows/_train_quantum_one.yml"
   pull_request:
     branches: [feat/torch_qdrop]
     paths:
@@ -18,13 +37,11 @@ on:
       - "src/training/**"
       - "src/data/**"
       - "src/train_quantum_models.py"
+      - "scripts/generate_cml_report.py"
       - ".github/workflows/train_quantum_graph.yml"
+      - ".github/workflows/_train_quantum_one.yml"
   workflow_dispatch:
     inputs:
-      algorithm:
-        description: "Q-Drop mode: baseline | pruning | dropout | both"
-        required: false
-        default: "baseline"
       epochs:
         description: "Max training epochs per fold"
         required: false
@@ -34,665 +51,315 @@ on:
         required: false
         default: "16"
 
+# Reusable workflow jobs inherit the caller's permissions, capped at the
+# caller's grant. The default caller-grant for reusable workflows is
+# read-only, which collides with the nested job that needs
+# ``contents: write`` (baseline updates) and ``pull-requests: write``
+# (CML comment posting). Granting them here propagates the same level
+# into the reusable workflow.
+permissions:
+  contents: write
+  pull-requests: write
+
 jobs:
-  train:
-    runs-on: [A6000]
+  train-pruning:
+    name: Train (pruning, A6000)
+    uses: ./.github/workflows/_train_quantum_one.yml
+    secrets: inherit
+    with:
+      algorithm: pruning
+      runner-labels: '["self-hosted","A6000"]'
+      epochs: ${{ github.event.inputs.epochs || '100' }}
+      n_qubits: ${{ github.event.inputs.n_qubits || '' }}
+      post-cml-comment: false
+      watermark-title: "Q-Drop training — pruning"
+      artifact-suffix: pruning
+
+  report-pruning:
+    name: Report (pruning, A6000)
+    needs: train-pruning
+    runs-on: [self-hosted, A6000]
+    if: always() && needs.train-pruning.result == 'success'
     permissions:
+      # On `push` events CML targets commit comments
+      # (`POST /repos/{owner}/{repo}/commits/{sha}/comments`),
+      # which needs write-level contents scope.
       contents: write
       pull-requests: write
-
     env:
-      TORCH_VERSION: "2.2.0"
-      CUDA_TAG: "cu121"
+      ALGORITHM: pruning
+      WATERMARK_TITLE: "Q-Drop training — pruning"
       OUTPUT_DIR: ci_results
-
+      MPLCONFIGDIR: /tmp/matplotlib
     steps:
       - name: Add npm global bin to PATH
         run: echo "$HOME/.npm-global/bin" >> $GITHUB_PATH
 
       - uses: actions/checkout@v4
-        with:
-          fetch-depth: 0
-
-      - name: System info
-        run: |
-          echo "=== System ==="
-          uname -a
-          nvidia-smi || echo "No GPU detected"
-          echo "CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-all}"
 
       - name: Set up Python 3.10
         uses: actions/setup-python@v5
         with:
           python-version: "3.10"
 
-      - name: Install CML
+      - name: Install report-only deps
         run: |
-          npm install -g @dvcorg/cml
+          pip install --upgrade pip
+          pip install "matplotlib>=3.7.0" "numpy>=1.24.0"
 
-      - name: Install PyTorch (CUDA 12.1)
+      - name: Download pruning training artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: quantum-graph-metrics-pruning-${{ github.run_id }}
+          path: artifact-pruning
+
+      - name: Stage results for the report script
+        id: stage
         run: |
-          python -m pip install --upgrade pip setuptools wheel
-          pip install torch==2.2.0 --index-url https://download.pytorch.org/whl/cu121
-
-      - name: Install PyTorch Geometric
-        run: |
-          pip install \
-            pyg_lib \
-            torch_scatter \
-            torch_sparse \
-            torch_cluster \
-            torch_spline_conv \
-            -f https://data.pyg.org/whl/torch-2.2.0+cu121.html
-          pip install torch-geometric
-
-      - name: Install training dependencies
-        run: |
-          pip install \
-            "pennylane==0.38.0" \
-            "pennylane-lightning==0.38.0" \
-            "scikit-learn>=1.3.0" \
-            "numpy>=1.24.0" \
-            "matplotlib>=3.7.0" \
-            "tqdm>=4.66.0" \
-            "datasets>=2.18.0"
-
-      - name: Verify environment
-        run: |
-          python - << 'PYEOF'
-          import torch, torch_geometric, pennylane, sklearn, numpy, datasets
-          print(f"PyTorch:        {torch.__version__}")
-          print(f"CUDA available: {torch.cuda.is_available()}")
-          if torch.cuda.is_available():
-              print(f"GPU:            {torch.cuda.get_device_name(0)}")
-              props = torch.cuda.get_device_properties(0)
-              print(f"VRAM:           {props.total_memory / 1e9:.1f} GB")
-          print(f"PyG:            {torch_geometric.__version__}")
-          print(f"PennyLane:      {pennylane.__version__}")
-          print(f"scikit-learn:   {sklearn.__version__}")
-          print(f"NumPy:          {numpy.__version__}")
-          print(f"HF datasets:    {datasets.__version__}")
-          PYEOF
-
-      - name: Run training — MUTAG & PROTEINS
-        env:
-          ALGORITHM: ${{ github.event.inputs.algorithm || 'both' }}
-          EPOCHS: ${{ github.event.inputs.epochs || '100' }}
-          N_QUBITS: ${{ github.event.inputs.n_qubits || '' }}
-
-        run: |
-          echo "Q-Drop algorithm : $ALGORITHM"
-          echo "Max epochs       : $EPOCHS"
-          if [ -n "$N_QUBITS" ]; then
-            echo "Quantum width    : $N_QUBITS"
-            python src/train_quantum_models.py \
-              --datasets mutag proteins \
-              --epochs "$EPOCHS" \
-              --algorithm "$ALGORITHM" \
-              --n-qubits "$N_QUBITS" \
-              --batch-size 32 \
-              --prune-window 4 \
-              --output-dir "$OUTPUT_DIR" \
-              --seed 42
+          mkdir -p "$OUTPUT_DIR"
+          if [ -d artifact-pruning/ci_results ]; then
+            cp -r artifact-pruning/ci_results/* "$OUTPUT_DIR"/
           else
-            python src/train_quantum_models.py \
-              --datasets mutag proteins \
-              --epochs "$EPOCHS" \
-              --algorithm "$ALGORITHM" \
-              --output-dir "$OUTPUT_DIR" \
-              --seed 42
+            cp -r artifact-pruning/* "$OUTPUT_DIR"/ 2>/dev/null || true
           fi
-          echo "ALGORITHM=$ALGORITHM" >> $GITHUB_ENV
-
-      - name: Locate results directory
-        run: |
           RESULTS_DIR=$(ls -dt "$OUTPUT_DIR"/quantum_graph_training_* 2>/dev/null | head -1)
           if [ -z "$RESULTS_DIR" ]; then
-            echo "ERROR: no training output found under $OUTPUT_DIR"
+            echo "ERROR: pruning artifact did not contain a quantum_graph_training_* directory"
+            ls -R artifact-pruning
             exit 1
           fi
-          echo "RESULTS_DIR=$RESULTS_DIR" >> $GITHUB_ENV
-          echo "Results at: $RESULTS_DIR"
+          echo "RESULTS_DIR=$RESULTS_DIR" >> "$GITHUB_ENV"
+          echo "results-dir=$RESULTS_DIR" >> "$GITHUB_OUTPUT"
           ls -lah "$RESULTS_DIR"
 
-      - name: Generate CML report
+      - name: Generate CML report (pruning)
         env:
-          MPLCONFIGDIR: /tmp/matplotlib
+          REPORT_INCLUDE_INLINE_ASSETS: "true"
+          REPORT_PATH: report.md
+          BASELINE_PATH: quantum_graph_baseline.json
+        run: |
+          python scripts/generate_cml_report.py
+
+      - name: Post / update CML comment (pruning)
+        env:
           REPO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           cml ci
+          cml comment update --watermark-title="$WATERMARK_TITLE" report.md
 
-          python - << 'PYEOF'
-          import json
-          import math
-          import os
-          from pathlib import Path
-
-          import matplotlib.pyplot as plt
-          import numpy as np
-
-          results_dir = Path(os.environ["RESULTS_DIR"])
-          assets_dir = results_dir / "report_assets"
-          assets_dir.mkdir(parents=True, exist_ok=True)
-          algorithm = os.environ.get("ALGORITHM", "baseline")
-          ref = os.environ.get("GITHUB_REF_NAME", "unknown")
-          sha = os.environ.get("GITHUB_SHA", "")[:8]
-          run_id = os.environ.get("GITHUB_RUN_ID", "")
-          repo = os.environ.get("GITHUB_REPOSITORY", "")
-          workflow_name = os.environ.get("GITHUB_WORKFLOW", "unknown")
-
-          with open(results_dir / "summary.json", encoding="utf-8") as summary_file:
-              summary = json.load(summary_file)
-
-          metrics = ["accuracy", "precision", "recall", "f1", "roc_auc", "pr_auc"]
-          primary_metrics = ["accuracy", "f1", "roc_auc", "pr_auc"]
-          preferred_dataset_order = ["mutag", "proteins"]
-          ordered_keys = [key for key in preferred_dataset_order if key in summary] + [
-              key for key in summary if key not in preferred_dataset_order
-          ]
-          run_url = f"https://github.com/{repo}/actions/runs/{run_id}" if repo and run_id else "#"
-
-          def format_scalar(value):
-              if value is None:
-                  return "—"
-              if isinstance(value, bool):
-                  return "Yes" if value else "No"
-              if isinstance(value, float):
-                  if math.isnan(value) or math.isinf(value):
-                      return "—"
-                  return f"{value:.4f}"
-              return str(value)
-
-          def format_mean_std(mean_value, std_value):
-              if mean_value is None or std_value is None:
-                  return "—"
-              if any(math.isnan(v) or math.isinf(v) for v in (mean_value, std_value)):
-                  return "—"
-              return f"{mean_value:.4f} +/- {std_value:.4f}"
-
-          def select_best_fold(result):
-              folds = result.get("folds", [])
-              if not folds:
-                  return None
-              return max(folds, key=lambda fold: fold.get("accuracy", 0.0))
-
-          overview_chart = assets_dir / "quantum_graph_overview.png"
-          curve_chart = assets_dir / "quantum_graph_learning_curves.png"
-          qdrop_chart = assets_dir / "quantum_graph_qdrop_progress.png"
-
-          if ordered_keys:
-              metric_labels = ["Accuracy", "F1", "ROC AUC", "PR AUC"]
-              x_positions = np.arange(len(metric_labels))
-              bar_width = 0.35 if len(ordered_keys) > 1 else 0.55
-              colors = ["#2E86AB", "#F18F01", "#C73E1D", "#3B8B5A"]
-
-              figure, axis = plt.subplots(figsize=(12, 6))
-              for index, dataset_key in enumerate(ordered_keys):
-                  result = summary[dataset_key]
-                  stats = result.get("summary", {})
-                  means = [stats.get(f"mean_{metric}", 0.0) for metric in primary_metrics]
-                  stds = [stats.get(f"std_{metric}", 0.0) for metric in primary_metrics]
-                  offset = (index - (len(ordered_keys) - 1) / 2) * bar_width
-                  axis.bar(
-                      x_positions + offset,
-                      means,
-                      width=bar_width,
-                      yerr=stds,
-                      capsize=4,
-                      label=result.get("dataset", dataset_key.upper()),
-                      color=colors[index % len(colors)],
-                      alpha=0.92,
-                  )
-
-              axis.set_title("Cross-Dataset Performance Overview", fontsize=14, weight="bold")
-              axis.set_xticks(x_positions)
-              axis.set_xticklabels(metric_labels)
-              axis.set_ylabel("Score")
-              axis.set_ylim(0.0, 1.05)
-              axis.grid(axis="y", linestyle="--", alpha=0.3)
-              axis.legend(frameon=False)
-              figure.tight_layout()
-              figure.savefig(overview_chart, dpi=200, bbox_inches="tight")
-              plt.close(figure)
-
-              figure, axes = plt.subplots(
-                  len(ordered_keys),
-                  2,
-                  figsize=(14, 5 * max(len(ordered_keys), 1)),
-                  squeeze=False,
-              )
-              for row_index, dataset_key in enumerate(ordered_keys):
-                  result = summary[dataset_key]
-                  dataset_label = result.get("dataset", dataset_key.upper())
-                  best_fold = select_best_fold(result)
-                  loss_axis = axes[row_index][0]
-                  score_axis = axes[row_index][1]
-
-                  if best_fold is None:
-                      loss_axis.set_axis_off()
-                      score_axis.set_axis_off()
-                      continue
-
-                  train_curve = best_fold.get("train_curve", [])
-                  val_curve = best_fold.get("val_curve", [])
-                  train_epochs = [point["epoch"] for point in train_curve]
-                  val_epochs = [point["epoch"] for point in val_curve]
-
-                  if train_curve:
-                      loss_axis.plot(
-                          train_epochs,
-                          [point.get("loss", 0.0) for point in train_curve],
-                          label="Train Loss",
-                          color="#2E86AB",
-                          linewidth=2,
-                      )
-                  if val_curve:
-                      loss_axis.plot(
-                          val_epochs,
-                          [point.get("loss", 0.0) for point in val_curve],
-                          label="Val Loss",
-                          color="#C73E1D",
-                          linewidth=2,
-                      )
-                  loss_axis.set_title(
-                      f"{dataset_label} Best Fold #{best_fold['fold']} Loss",
-                      fontsize=12,
-                      weight="bold",
-                  )
-                  loss_axis.set_xlabel("Epoch")
-                  loss_axis.set_ylabel("Loss")
-                  loss_axis.grid(alpha=0.3, linestyle="--")
-                  loss_axis.legend(frameon=False)
-
-                  if train_curve:
-                      score_axis.plot(
-                          train_epochs,
-                          [point.get("accuracy", 0.0) for point in train_curve],
-                          label="Train Acc",
-                          color="#2E86AB",
-                          linewidth=2,
-                      )
-                  if val_curve:
-                      score_axis.plot(
-                          val_epochs,
-                          [point.get("accuracy", 0.0) for point in val_curve],
-                          label="Val Acc",
-                          color="#F18F01",
-                          linewidth=2,
-                      )
-                      score_axis.plot(
-                          val_epochs,
-                          [point.get("f1", 0.0) for point in val_curve],
-                          label="Val F1",
-                          color="#3B8B5A",
-                          linewidth=2,
-                      )
-                  score_axis.set_title(
-                      f"{dataset_label} Best Fold #{best_fold['fold']} Accuracy / F1",
-                      fontsize=12,
-                      weight="bold",
-                  )
-                  score_axis.set_xlabel("Epoch")
-                  score_axis.set_ylabel("Score")
-                  score_axis.set_ylim(0.0, 1.05)
-                  score_axis.grid(alpha=0.3, linestyle="--")
-                  score_axis.legend(frameon=False)
-
-              figure.tight_layout()
-              figure.savefig(curve_chart, dpi=200, bbox_inches="tight")
-              plt.close(figure)
-
-              if algorithm in {"pruning", "dropout", "both"}:
-                  figure, axes = plt.subplots(
-                      len(ordered_keys),
-                      2,
-                      figsize=(14, 4.5 * max(len(ordered_keys), 1)),
-                      squeeze=False,
-                  )
-                  for row_index, dataset_key in enumerate(ordered_keys):
-                      result = summary[dataset_key]
-                      dataset_label = result.get("dataset", dataset_key.upper())
-                      best_fold = select_best_fold(result)
-                      phase_axis = axes[row_index][0]
-                      drop_axis = axes[row_index][1]
-
-                      if best_fold is None:
-                          phase_axis.set_axis_off()
-                          drop_axis.set_axis_off()
-                          continue
-
-                      qdrop_curve = best_fold.get("qdrop_curve", [])
-                      if not qdrop_curve:
-                          phase_axis.set_axis_off()
-                          drop_axis.set_axis_off()
-                          continue
-
-                      qdrop_epochs = [point.get("epoch", 0) for point in qdrop_curve]
-                      prune_ratio = [point.get("prune_ratio", 0.0) for point in qdrop_curve]
-                      prune_steps = [point.get("pruning_step_count", 0) for point in qdrop_curve]
-                      prune_phase = [point.get("is_prune_phase", 0) for point in qdrop_curve]
-                      dropout_enabled = [point.get("dropout_enabled", 0) for point in qdrop_curve]
-                      dropped_wire_count = [point.get("dropped_wire_count", 0) for point in qdrop_curve]
-                      active_dropout_layers = [point.get("active_dropout_layers", 0) for point in qdrop_curve]
-
-                      phase_axis.plot(
-                          qdrop_epochs,
-                          prune_ratio,
-                          color="#2E86AB",
-                          linewidth=2,
-                          label="Prune Ratio",
-                      )
-                      phase_axis.step(
-                          qdrop_epochs,
-                          prune_phase,
-                          where="mid",
-                          color="#C73E1D",
-                          linewidth=2,
-                          label="Prune Phase",
-                      )
-                      phase_axis.plot(
-                          qdrop_epochs,
-                          prune_steps,
-                          color="#3B8B5A",
-                          linewidth=2,
-                          label="Pruning Steps",
-                      )
-                      phase_axis.set_title(
-                          f"{dataset_label} Best Fold #{best_fold['fold']} Pruning Progress",
-                          fontsize=12,
-                          weight="bold",
-                      )
-                      phase_axis.set_xlabel("Epoch")
-                      phase_axis.set_ylabel("Value")
-                      phase_axis.grid(alpha=0.3, linestyle="--")
-                      phase_axis.legend(frameon=False)
-
-                      drop_axis.step(
-                          qdrop_epochs,
-                          dropout_enabled,
-                          where="mid",
-                          color="#F18F01",
-                          linewidth=2,
-                          label="Dropout Enabled",
-                      )
-                      drop_axis.plot(
-                          qdrop_epochs,
-                          dropped_wire_count,
-                          color="#7B2CBF",
-                          linewidth=2,
-                          label="Dropped Wires",
-                      )
-                      drop_axis.plot(
-                          qdrop_epochs,
-                          active_dropout_layers,
-                          color="#00897B",
-                          linewidth=2,
-                          label="Active Dropout Layers",
-                      )
-                      drop_axis.set_title(
-                          f"{dataset_label} Best Fold #{best_fold['fold']} Dropout Progress",
-                          fontsize=12,
-                          weight="bold",
-                      )
-                      drop_axis.set_xlabel("Epoch")
-                      drop_axis.set_ylabel("Count / Flag")
-                      drop_axis.grid(alpha=0.3, linestyle="--")
-                      drop_axis.legend(frameon=False)
-
-                  figure.tight_layout()
-                  figure.savefig(qdrop_chart, dpi=200, bbox_inches="tight")
-                  plt.close(figure)
-
-          lines = [
-              "# Quantum Graph Training Report — MUTAG & PROTEINS",
-              "",
-              f"**Branch:** `{ref}` | **Commit:** `{sha}` | **Run:** [{run_id}]({run_url})",
-              f"**Algorithm:** `{algorithm}` | **Model:** QGCN",
-              "",
-              "## Run Overview",
-              "",
-              "| Property | Value |",
-              "|----------|-------|",
-              f"| Workflow | `{workflow_name}` |",
-              f"| Branch | `{ref}` |",
-              f"| Commit | `{sha}` |",
-              f"| Run | [{run_id}]({run_url}) |",
-              f"| Algorithm | `{algorithm}` |",
-              f"| Model | `QGCN` |",
-              f"| Datasets | {', '.join(summary[key].get('dataset', key.upper()) for key in ordered_keys)} |",
-              "",
-              "## Dataset Overview",
-              "",
-              "| Dataset | Source | Graphs | Classes | Node Feature Dim | Task |",
-              "|---------|--------|-------:|--------:|-----------------:|------|",
-          ]
-
-          for dataset_key in ordered_keys:
-              result = summary[dataset_key]
-              source = result.get("dataset_source", "—")
-              source_url = f"https://huggingface.co/datasets/{source}" if source != "—" else "#"
-              lines.append(
-                  f"| {result.get('dataset', dataset_key.upper())} | [{source}]({source_url}) | "
-                  f"{result.get('n_graphs', '—')} | {result.get('n_classes', '—')} | "
-                  f"{result.get('node_feature_dim', '—')} | {result.get('task', '—')} |"
-              )
-
-          reference_config = summary[ordered_keys[0]].get("config", {}) if ordered_keys else {}
-          config_rows = [
-              ("Epochs", reference_config.get("epochs")),
-              ("Learning rate", reference_config.get("lr")),
-              ("Weight decay", reference_config.get("weight_decay")),
-              ("Batch size", reference_config.get("batch_size")),
-              ("Q-depths", reference_config.get("q_depths")),
-              ("Quantum width", reference_config.get("n_qubits")),
-              ("Folds", reference_config.get("n_folds")),
-              ("Early stop patience", reference_config.get("early_stop_patience")),
-              ("Validation frequency", reference_config.get("val_frequency")),
-              ("Gradient clip", reference_config.get("grad_clip")),
-              ("LR scheduler", reference_config.get("use_scheduler")),
-              ("Class weights", reference_config.get("use_class_weights")),
-              ("Q-Drop schedule", reference_config.get("qdrop_schedule")),
-              ("Dropout probability", reference_config.get("dropout_prob")),
-              ("Dropped wires / layer", reference_config.get("n_drop_wires")),
-              ("Forward output masking", reference_config.get("enable_forward_mask")),
-              ("Seed", reference_config.get("seed")),
-          ]
-          if algorithm in {"pruning", "both"}:
-              config_rows.extend(
-                  [
-                      ("Accumulate window", reference_config.get("accumulate_window")),
-                      ("Prune window", reference_config.get("prune_window")),
-                      ("Prune ratio", reference_config.get("prune_ratio")),
-                  ]
-              )
-
-          lines += [
-              "",
-              "## Shared Training Configuration",
-              "",
-              "| Parameter | Value |",
-              "|-----------|-------|",
-          ]
-          for label, value in config_rows:
-              lines.append(f"| {label} | {format_scalar(value)} |")
-
-          lines += [
-              "",
-              "## Aggregate Results",
-              "",
-              "| Dataset | Accuracy | F1 | ROC AUC | PR AUC | Precision | Recall |",
-              "|---------|----------|----|---------|--------|-----------|--------|",
-          ]
-          for dataset_key in ordered_keys:
-              result = summary[dataset_key]
-              stats = result.get("summary", {})
-              lines.append(
-                  f"| {result.get('dataset', dataset_key.upper())} | "
-                  f"{format_mean_std(stats.get('mean_accuracy'), stats.get('std_accuracy'))} | "
-                  f"{format_mean_std(stats.get('mean_f1'), stats.get('std_f1'))} | "
-                  f"{format_mean_std(stats.get('mean_roc_auc'), stats.get('std_roc_auc'))} | "
-                  f"{format_mean_std(stats.get('mean_pr_auc'), stats.get('std_pr_auc'))} | "
-                  f"{format_mean_std(stats.get('mean_precision'), stats.get('std_precision'))} | "
-                  f"{format_mean_std(stats.get('mean_recall'), stats.get('std_recall'))} |"
-              )
-
-          for dataset_key in ordered_keys:
-              result = summary[dataset_key]
-              dataset = result.get("dataset", dataset_key.upper())
-              cfg = result.get("config", {})
-              stats = result.get("summary", {})
-              folds = result.get("folds", [])
-              best_fold = select_best_fold(result)
-
-              lines += [
-                  "",
-                  f"## {dataset}",
-                  "",
-                  "### Configuration",
-                  "",
-                  "| Parameter | Value |",
-                  "|-----------|-------|",
-                  f"| Epochs | {format_scalar(cfg.get('epochs'))} |",
-                  f"| Learning rate | {format_scalar(cfg.get('lr'))} |",
-                  f"| Weight decay | {format_scalar(cfg.get('weight_decay'))} |",
-                  f"| Batch size | {format_scalar(cfg.get('batch_size'))} |",
-                  f"| Q-depths | {format_scalar(cfg.get('q_depths'))} |",
-                  f"| Quantum width | {format_scalar(cfg.get('n_qubits'))} |",
-                  f"| Folds | {format_scalar(cfg.get('n_folds'))} |",
-                  f"| Early stop patience | {format_scalar(cfg.get('early_stop_patience'))} |",
-                  f"| Validation frequency | {format_scalar(cfg.get('val_frequency'))} |",
-                  f"| Gradient clip | {format_scalar(cfg.get('grad_clip'))} |",
-                  f"| LR scheduler | {format_scalar(cfg.get('use_scheduler'))} |",
-                  f"| Class weights | {format_scalar(cfg.get('use_class_weights'))} |",
-                  f"| Seed | {format_scalar(cfg.get('seed'))} |",
-                  "",
-                  "### Aggregate Results",
-                  "",
-                  "| Metric | Mean | Std |",
-                  "|--------|------|-----|",
-              ]
-              for metric in metrics:
-                  lines.append(
-                      f"| {metric.upper()} | "
-                      f"{format_scalar(stats.get(f'mean_{metric}'))} | "
-                      f"{format_scalar(stats.get(f'std_{metric}'))} |"
-                  )
-
-              if best_fold is not None:
-                  lines += [
-                      "",
-                      "### Best Fold Snapshot",
-                      "",
-                      "| Fold | Test Loss | Accuracy | F1 | Precision | Recall | ROC AUC | PR AUC |",
-                      "|------|-----------|----------|----|-----------|--------|---------|--------|",
-                      f"| {best_fold.get('fold', '—')} | {format_scalar(best_fold.get('test_loss'))} | "
-                      f"{format_scalar(best_fold.get('accuracy'))} | {format_scalar(best_fold.get('f1'))} | "
-                      f"{format_scalar(best_fold.get('precision'))} | {format_scalar(best_fold.get('recall'))} | "
-                      f"{format_scalar(best_fold.get('roc_auc'))} | {format_scalar(best_fold.get('pr_auc'))} |",
-                  ]
-
-              lines += [
-                  "",
-                  "### Per-Fold Results",
-                  "",
-                  "| Fold | Test Loss | " + " | ".join(metric.upper() for metric in metrics) + " |",
-                  "|" + " --- |" * (len(metrics) + 2),
-              ]
-              for fold in folds:
-                  fold_values = " | ".join(format_scalar(fold.get(metric)) for metric in metrics)
-                  lines.append(
-                      f"| {fold['fold']} | {format_scalar(fold.get('test_loss'))} | {fold_values} |"
-                  )
-
-          baseline_path = Path("quantum_graph_baseline.json")
-          if baseline_path.exists():
-              with open(baseline_path, encoding="utf-8") as baseline_file:
-                  baseline = json.load(baseline_file)
-              lines += [
-                  "",
-                  "## Baseline Comparison",
-                  "",
-                  "| Dataset | Metric | Baseline | Current | Delta | Status |",
-                  "|---------|--------|----------|---------|-------|--------|",
-              ]
-              for dataset_key in ordered_keys:
-                  current_stats = summary[dataset_key].get("summary", {})
-                  baseline_stats = baseline.get(dataset_key, {}).get("summary", {})
-                  dataset = summary[dataset_key].get("dataset", dataset_key.upper())
-                  for metric in ["accuracy", "f1", "roc_auc", "pr_auc"]:
-                      current_value = current_stats.get(f"mean_{metric}", float("nan"))
-                      baseline_value = baseline_stats.get(f"mean_{metric}", float("nan"))
-                      delta = current_value - baseline_value
-                      sign = "+" if delta >= 0 else ""
-                      if delta > 0.005:
-                          status = "Improved"
-                      elif delta < -0.01:
-                          status = "Regression"
-                      else:
-                          status = "Stable"
-                      lines.append(
-                          f"| {dataset} | {metric.upper()} | {baseline_value:.4f} | "
-                          f"{current_value:.4f} | {sign}{delta:.4f} | {status} |"
-                      )
-          else:
-              lines += [
-                  "",
-                  "> No baseline found; this run will become the baseline after merge to `main`.",
-              ]
-
-          lines += [
-              "",
-              "## Visualizations",
-              "",
-              "The charts below summarize cross-dataset performance, best-fold learning curves, and Q-Drop progress for each dataset.",
-          ]
-
-          with open("report.md", "w", encoding="utf-8") as report_file:
-              report_file.write("\n".join(lines) + "\n")
-          PYEOF
-
-          if [ -f "$RESULTS_DIR/report_assets/quantum_graph_overview.png" ]; then
-            echo "" >> report.md
-            echo "### Performance Overview" >> report.md
-            echo "" >> report.md
-            cml publish "$RESULTS_DIR/report_assets/quantum_graph_overview.png" --md >> report.md
-          fi
-
-          if [ -f "$RESULTS_DIR/report_assets/quantum_graph_learning_curves.png" ]; then
-            echo "" >> report.md
-            echo "### Best-Fold Learning Curves" >> report.md
-            echo "" >> report.md
-            cml publish "$RESULTS_DIR/report_assets/quantum_graph_learning_curves.png" --md >> report.md
-          fi
-
-          if [ -f "$RESULTS_DIR/report_assets/quantum_graph_qdrop_progress.png" ]; then
-            echo "" >> report.md
-            echo "### Q-Drop Progress" >> report.md
-            echo "" >> report.md
-            cml publish "$RESULTS_DIR/report_assets/quantum_graph_qdrop_progress.png" --md >> report.md
-          fi
-
-          cml comment create report.md
-
-      - name: Upload training artifacts
+      - name: Re-upload pruning report (with charts regenerated on A6000)
         uses: actions/upload-artifact@v4
         if: always()
         with:
-          name: quantum-graph-metrics-${{ github.run_id }}
+          name: quantum-graph-metrics-pruning-final-${{ github.run_id }}
           path: |
-            ${{ env.RESULTS_DIR }}/summary.json
-            ${{ env.RESULTS_DIR }}/mutag/metrics.json
-            ${{ env.RESULTS_DIR }}/proteins/metrics.json
-            ${{ env.RESULTS_DIR }}/report_assets/*.png
+            ${{ steps.stage.outputs.results-dir }}/summary.json
+            ${{ steps.stage.outputs.results-dir }}/report_assets/*.png
             report.md
           retention-days: 30
+          if-no-files-found: warn
 
-      - name: Commit baseline on main push
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
+  train-dropout:
+    name: Train (dropout, P6000)
+    uses: ./.github/workflows/_train_quantum_one.yml
+    secrets: inherit
+    with:
+      algorithm: dropout
+      runner-labels: '["self-hosted","P6000"]'
+      epochs: ${{ github.event.inputs.epochs || '100' }}
+      n_qubits: ${{ github.event.inputs.n_qubits || '' }}
+      # P6000 cannot reach CML's asset upload backend — skip the post here
+      # and let `report-dropout` handle it from the A6000 instead.
+      post-cml-comment: false
+      watermark-title: "Q-Drop training — dropout"
+      artifact-suffix: dropout
+
+  report-dropout:
+    name: Report (dropout, A6000)
+    needs: train-dropout
+    runs-on: [self-hosted, A6000]
+    if: always() && needs.train-dropout.result == 'success'
+    permissions:
+      # On `push` events CML targets commit comments
+      # (`POST /repos/{owner}/{repo}/commits/{sha}/comments`),
+      # which needs write-level contents scope.
+      contents: write
+      pull-requests: write
+    env:
+      ALGORITHM: dropout
+      WATERMARK_TITLE: "Q-Drop training — dropout"
+      OUTPUT_DIR: ci_results
+      MPLCONFIGDIR: /tmp/matplotlib
+    steps:
+      - name: Add npm global bin to PATH
+        run: echo "$HOME/.npm-global/bin" >> $GITHUB_PATH
+
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install report-only deps
         run: |
-          cp "$RESULTS_DIR/summary.json" quantum_graph_baseline.json
-          git config user.email "ci@example.com"
-          git config user.name "CI Bot"
-          git add quantum_graph_baseline.json
-          git commit -m "metrics: update quantum-graph baseline [skip ci]" || true
-          git push origin HEAD:main || true
+          # The dropout report only re-renders charts + Markdown from the
+          # uploaded summary.json. We do not need torch / pyg / pennylane
+          # here, just the plotting + JSON stack.
+          pip install --upgrade pip
+          pip install "matplotlib>=3.7.0" "numpy>=1.24.0"
+
+      - name: Download dropout training artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: quantum-graph-metrics-dropout-${{ github.run_id }}
+          path: artifact-dropout
+
+      - name: Stage results for the report script
+        id: stage
+        run: |
+          # The artifact preserves the original ``ci_results/quantum_graph_*``
+          # path tree, but only the bits we explicitly uploaded. Mirror it
+          # back into the workspace so generate_cml_report.py sees the same
+          # ``RESULTS_DIR`` layout it would on the training runner.
+          mkdir -p "$OUTPUT_DIR"
+          if [ -d artifact-dropout/ci_results ]; then
+            cp -r artifact-dropout/ci_results/* "$OUTPUT_DIR"/
+          else
+            cp -r artifact-dropout/* "$OUTPUT_DIR"/ 2>/dev/null || true
+          fi
+          RESULTS_DIR=$(ls -dt "$OUTPUT_DIR"/quantum_graph_training_* 2>/dev/null | head -1)
+          if [ -z "$RESULTS_DIR" ]; then
+            echo "ERROR: dropout artifact did not contain a quantum_graph_training_* directory"
+            ls -R artifact-dropout
+            exit 1
+          fi
+          echo "RESULTS_DIR=$RESULTS_DIR" >> "$GITHUB_ENV"
+          echo "results-dir=$RESULTS_DIR" >> "$GITHUB_OUTPUT"
+          ls -lah "$RESULTS_DIR"
+
+      - name: Generate CML report (dropout)
+        env:
+          REPORT_INCLUDE_INLINE_ASSETS: "true"
+          REPORT_PATH: report.md
+          BASELINE_PATH: quantum_graph_baseline.json
+        run: |
+          python scripts/generate_cml_report.py
+
+      - name: Post / update CML comment (dropout)
+        env:
+          REPO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cml ci
+          cml comment update --watermark-title="$WATERMARK_TITLE" report.md
+
+      - name: Re-upload dropout report (with charts regenerated on A6000)
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: quantum-graph-metrics-dropout-final-${{ github.run_id }}
+          path: |
+            ${{ steps.stage.outputs.results-dir }}/summary.json
+            ${{ steps.stage.outputs.results-dir }}/report_assets/*.png
+            report.md
+          retention-days: 30
+          if-no-files-found: warn
+
+  train-both:
+    name: Train (both, P6000)
+    needs: [report-pruning, report-dropout]
+    uses: ./.github/workflows/_train_quantum_one.yml
+    secrets: inherit
+    with:
+      algorithm: both
+      runner-labels: '["self-hosted","P6000"]'
+      epochs: ${{ github.event.inputs.epochs || '100' }}
+      n_qubits: ${{ github.event.inputs.n_qubits || '' }}
+      # P6000 cannot reach CML's upload backend; report in downstream A6000 job.
+      post-cml-comment: false
+      watermark-title: "Q-Drop training — both"
+      artifact-suffix: both
+
+  report-both:
+    name: Report (both, A6000)
+    needs: train-both
+    runs-on: [self-hosted, A6000]
+    if: always() && needs.train-both.result == 'success'
+    permissions:
+      # On `push` events CML targets commit comments
+      # (`POST /repos/{owner}/{repo}/commits/{sha}/comments`),
+      # which needs write-level contents scope.
+      contents: write
+      pull-requests: write
+    env:
+      ALGORITHM: both
+      WATERMARK_TITLE: "Q-Drop training — both"
+      OUTPUT_DIR: ci_results
+      MPLCONFIGDIR: /tmp/matplotlib
+    steps:
+      - name: Add npm global bin to PATH
+        run: echo "$HOME/.npm-global/bin" >> $GITHUB_PATH
+
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install report-only deps
+        run: |
+          pip install --upgrade pip
+          pip install "matplotlib>=3.7.0" "numpy>=1.24.0"
+
+      - name: Download both training artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: quantum-graph-metrics-both-${{ github.run_id }}
+          path: artifact-both
+
+      - name: Stage results for the report script
+        id: stage
+        run: |
+          mkdir -p "$OUTPUT_DIR"
+          if [ -d artifact-both/ci_results ]; then
+            cp -r artifact-both/ci_results/* "$OUTPUT_DIR"/
+          else
+            cp -r artifact-both/* "$OUTPUT_DIR"/ 2>/dev/null || true
+          fi
+          RESULTS_DIR=$(ls -dt "$OUTPUT_DIR"/quantum_graph_training_* 2>/dev/null | head -1)
+          if [ -z "$RESULTS_DIR" ]; then
+            echo "ERROR: both artifact did not contain a quantum_graph_training_* directory"
+            ls -R artifact-both
+            exit 1
+          fi
+          echo "RESULTS_DIR=$RESULTS_DIR" >> "$GITHUB_ENV"
+          echo "results-dir=$RESULTS_DIR" >> "$GITHUB_OUTPUT"
+          ls -lah "$RESULTS_DIR"
+
+      - name: Generate CML report (both)
+        env:
+          REPORT_INCLUDE_INLINE_ASSETS: "true"
+          REPORT_PATH: report.md
+          BASELINE_PATH: quantum_graph_baseline.json
+        run: |
+          python scripts/generate_cml_report.py
+
+      - name: Post / update CML comment (both)
+        env:
+          REPO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cml ci
+          cml comment update --watermark-title="$WATERMARK_TITLE" report.md
+
+      - name: Re-upload both report (with charts regenerated on A6000)
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: quantum-graph-metrics-both-final-${{ github.run_id }}
+          path: |
+            ${{ steps.stage.outputs.results-dir }}/summary.json
+            ${{ steps.stage.outputs.results-dir }}/report_assets/*.png
+            report.md
+          retention-days: 30
+          if-no-files-found: warn

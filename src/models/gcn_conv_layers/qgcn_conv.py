@@ -1,5 +1,8 @@
+import math
+
 import torch
-from torch.nn import Linear, Parameter
+from torch.nn import LayerNorm, Linear, Parameter
+from torch.nn.utils.parametrizations import orthogonal as orthogonal_parametrization
 from torch_geometric.nn import MessagePassing
 from torch_geometric.utils import add_self_loops, degree
 
@@ -13,7 +16,7 @@ except ImportError:
 
 
 class QGCNConv(MessagePassing):
-    def __init__(self, in_channels, n_layers, n_qubits=None):
+    def __init__(self, in_channels, n_layers, n_qubits=None, use_strongly_entangling=False):
         super().__init__(aggr='add')  # "Add" aggregation (Step 5).
         
         # Limit qubits to at most 16 for practical quantum simulation
@@ -43,16 +46,40 @@ class QGCNConv(MessagePassing):
             self.feature_reduction = Linear(in_channels, n_qubits, bias=False)
         else:
             self.feature_reduction = None
-        
-        self.quantum_layer = quantum_net(self.n_qubits, self.n_layers)
+
+        # LayerNorm before the tanh*pi bound. The pre-tanh logits drift in
+        # scale across epochs (especially when Q-Drop masks reshape the
+        # effective circuit), so tanh oscillates between linear and
+        # saturated regimes and the quantum input distribution becomes
+        # non-stationary. Normalizing across the qubit axis stabilizes the
+        # angle distribution fed into BasicEntanglerLayers without changing
+        # tensor shape.
+        self.input_norm = LayerNorm(n_qubits)
+
+        self.quantum_layer = quantum_net(self.n_qubits, self.n_layers, use_strongly_entangling=use_strongly_entangling)
         self.qc = self.quantum_layer
         self.bias = Parameter(torch.empty(n_qubits))
         self.reset_parameters()
+
+        # Cayley-parametrized orthogonality on the quantum input projection.
+        # Forces feature_reduction.weight to remain semi-orthogonal across
+        # training, so the projection from in_channels -> n_qubits stays
+        # near-isometric and the angle distribution fed into the quantum
+        # circuit keeps roughly unit-norm energy per direction. Registered
+        # after reset_parameters so the underlying tensor is initialized
+        # first and the parametrization just projects it.
+        if self.feature_reduction is not None:
+            orthogonal_parametrization(
+                self.feature_reduction,
+                name="weight",
+                orthogonal_map="cayley",
+            )
 
     def reset_parameters(self):
         self.bias.data.zero_()
         if self.feature_reduction is not None:
             self.feature_reduction.reset_parameters()
+        self.input_norm.reset_parameters()
 
     def forward(self, x, edge_index):
         # x has shape [N, in_channels]
@@ -66,6 +93,18 @@ class QGCNConv(MessagePassing):
             x_reduced = self.feature_reduction(x)
         else:
             x_reduced = x
+
+        # Stabilize the quantum input distribution before bounding it.
+        # LayerNorm centers and scales per-node across the qubit axis so
+        # tanh stays in its informative range epoch-to-epoch.
+        x_reduced = self.input_norm(x_reduced)
+
+        # Bound quantum-circuit input to a well-defined angle range so
+        # BasicEntanglerLayers rotations stay within [-pi, pi] regardless of
+        # the upstream feature scale. Unbounded inputs wrap the rotation
+        # angles and turn the quantum gradient surface chaotic, which shows
+        # up downstream as simultaneous gradient spikes and underfitting.
+        x_reduced = torch.tanh(x_reduced) * math.pi
 
         # Step 3: Apply quantum circuit
         q_out = self.quantum_layer(x_reduced).float()

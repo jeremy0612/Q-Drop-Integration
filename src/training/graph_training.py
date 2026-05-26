@@ -4,9 +4,11 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import random
+import sys
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
@@ -14,6 +16,7 @@ from typing import Dict, List, Optional, Sequence, Tuple
 import numpy as np
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 import torch.optim as optim
 from sklearn.metrics import (
     accuracy_score,
@@ -32,7 +35,18 @@ from tqdm import tqdm
 from data.load_mutag import load_mutag
 from data.load_proteins import load_proteins
 from models.quantum_gcn import QGCN
+from models.quantum_gat import QGAT
 from qdrop import QDropConfig, QDropRuntimeFactory, TorchQDropRuntime
+
+# Allow importing from the top-level data_loader package that lives two
+# directories above src/training/ (project root → data_loader/).
+_project_root = str(Path(__file__).resolve().parents[2])
+if _project_root not in sys.path:
+    sys.path.insert(0, _project_root)
+
+from data_loader.load_nci1 import load_nci1
+from data_loader.load_imdb_binary import load_imdb_binary
+from data_loader.load_imdb_multi import load_imdb_multi
 
 
 @dataclass(frozen=True)
@@ -54,6 +68,80 @@ DATASET_SPECS: Dict[str, GraphDatasetSpec] = {
         source="graphs-datasets/PROTEINS",
         task="binary classification (enzyme vs non-enzyme)",
     ),
+    "nci1": GraphDatasetSpec(
+        name="NCI1",
+        source="TUDataset/NCI1",
+        task="binary classification (active vs inactive, lung cancer)",
+    ),
+    "imdb_binary": GraphDatasetSpec(
+        name="IMDB-BINARY",
+        source="TUDataset/IMDB-BINARY",
+        task="binary classification (Action vs Romance)",
+    ),
+    "imdb_multi": GraphDatasetSpec(
+        name="IMDB-MULTI",
+        source="TUDataset/IMDB-MULTI",
+        task="3-class classification (Comedy / Romance / Sci-Fi)",
+        n_classes=3,
+    ),
+}
+
+
+# Per-dataset quantum-tensor-width overrides. PROTEINS has only 4 node
+# features but ~39 nodes per graph and a wider class boundary than MUTAG,
+# so the default 8-wire bucket leaves the circuit under-expressive while
+# MUTAG (7 features) saturates 8 wires. Forcing PROTEINS to 16 doubles
+# the rotation-angle capacity at the cost of ~2x quantum runtime per
+# QGCNConv call.
+DATASET_NQUBITS_OVERRIDES: Dict[str, int] = {
+    "proteins": 16,
+    # NCI1 has 37-dim features; without override the bucketing sends it to
+    # 16 qubits (min(37,16)=16, >8 → bucket to 16). Force 8 so the
+    # simulator state per node is 2^8 instead of 2^16, keeping memory sane
+    # for the 4,110-graph dataset.
+    "nci1": 8,
+    # IMDB datasets use degree one-hot features (136 / 89 dims) which
+    # naturally bucket to 16 qubits. Keep 16 for expressiveness.
+    "imdb_binary": 16,
+    "imdb_multi": 16,
+}
+
+
+# Per-dataset batch-size overrides bound to n_qubits overrides. At
+# n_qubits=16 PennyLane default.qubit stores a 2^16-amplitude state per
+# node and (with backprop) every intermediate state in the circuit, so
+# memory scales linearly with (nodes_per_batch * 2^n_qubits * circuit
+# depth). PROTEINS averages ~39 nodes per graph, so batch_size=32 turns
+# into ~1248 nodes per batch and ~80 GB of stored state on a 16-wire
+# circuit, exceeding even an A6000. Dropping to 8 graphs trims memory ~4x
+# while keeping the gradient signal informative.
+DATASET_BATCHSIZE_OVERRIDES: Dict[str, int] = {
+    "proteins": 8,
+    # 16-qubit circuits need the same memory reduction as PROTEINS.
+    "imdb_binary": 8,
+    "imdb_multi": 8,
+}
+
+# Per-dataset model-architecture overrides that activate alongside the
+# n_qubits override (same applied_nqubits_override gate). Only fires when
+# the operator has not pinned n_qubits explicitly, preserving reproducibility
+# of pinned experiments. Each key maps to a dict of GraphTrainConfig fields.
+DATASET_MODEL_OVERRIDES: Dict[str, Dict] = {
+    # NCI1 overrides: multi-scale pooling + MLP head + residual give the
+    # largest accuracy gains at zero extra quantum-circuit cost.
+    # StronglyEntanglingLayers is omitted: it triples circuit cost
+    # (~6h total on 10-fold/150-epoch), while mean+max+add pooling and
+    # the MLP head already give the biggest accuracy boost.
+    "nci1": {
+        "pool_type": "multiscale",
+        "use_mlp_head": True,
+        "mlp_hidden": 64,
+        "mlp_dropout": 0.3,
+        "use_residual": True,
+        "q_depths": (3, 3),
+        "epochs": 150,
+        "early_stop_patience": 20,
+    },
 }
 
 
@@ -82,6 +170,15 @@ class GraphTrainConfig:
     enable_forward_mask: bool = True
     output_dir: str = "training_results"
     seed: int = 42
+    quantum_lr_scale: float = 0.1
+    pool_type: str = "mean"
+    use_mlp_head: bool = False
+    mlp_hidden: int = 64
+    mlp_dropout: float = 0.5
+    use_residual: bool = False
+    use_strongly_entangling: bool = False
+    model_type: str = "qgcn"
+    attn_dropout: float = 0.2
 
 
 class EarlyStopping:
@@ -116,11 +213,17 @@ def load_dataset_by_name(name: str):
         return load_mutag()
     if dataset_name in {"proteins", "protein"}:
         return load_proteins()
+    if dataset_name == "nci1":
+        return load_nci1()
+    if dataset_name in {"imdb_binary", "imdb-binary"}:
+        return load_imdb_binary()
+    if dataset_name in {"imdb_multi", "imdb-multi"}:
+        return load_imdb_multi()
     raise ValueError(f"Unsupported dataset: {name}")
 
 
 def normalize_dataset_name(name: str) -> str:
-    dataset_name = name.lower()
+    dataset_name = name.lower().replace("-", "_")
     if dataset_name == "protein":
         return "proteins"
     return dataset_name
@@ -136,46 +239,123 @@ def compute_class_weight(labels: Sequence[int], device: torch.device) -> torch.T
     return torch.tensor([pos_weight], dtype=torch.float, device=device)
 
 
-def compute_metrics(y_true: List[int], y_pred: List[int], y_prob: List[float]) -> Dict[str, float]:
+def compute_metrics(
+    y_true: List[int],
+    y_pred: List[int],
+    y_prob,
+    n_classes: int = 2,
+) -> Dict[str, float]:
     y_true_np = np.asarray(y_true).reshape(-1)
     y_pred_np = np.asarray(y_pred).reshape(-1)
-    y_prob_np = np.asarray(y_prob).reshape(-1)
 
+    avg = "binary" if n_classes == 2 else "macro"
     metrics = {
         "accuracy": float(accuracy_score(y_true_np, y_pred_np)),
-        "precision": float(precision_score(y_true_np, y_pred_np, zero_division=0)),
-        "recall": float(recall_score(y_true_np, y_pred_np, zero_division=0)),
-        "f1": float(f1_score(y_true_np, y_pred_np, zero_division=0)),
+        "precision": float(precision_score(y_true_np, y_pred_np, average=avg, zero_division=0)),
+        "recall": float(recall_score(y_true_np, y_pred_np, average=avg, zero_division=0)),
+        "f1": float(f1_score(y_true_np, y_pred_np, average=avg, zero_division=0)),
     }
 
-    try:
-        metrics["roc_auc"] = float(roc_auc_score(y_true_np, y_prob_np))
-    except ValueError:
-        metrics["roc_auc"] = 0.0
-
-    try:
-        metrics["pr_auc"] = float(average_precision_score(y_true_np, y_prob_np))
-    except ValueError:
-        metrics["pr_auc"] = 0.0
+    if n_classes == 2:
+        y_prob_np = np.asarray(y_prob).reshape(-1)
+        try:
+            metrics["roc_auc"] = float(roc_auc_score(y_true_np, y_prob_np))
+        except ValueError:
+            metrics["roc_auc"] = 0.0
+        try:
+            metrics["pr_auc"] = float(average_precision_score(y_true_np, y_prob_np))
+        except ValueError:
+            metrics["pr_auc"] = 0.0
+    else:
+        y_prob_np = np.asarray(y_prob)  # (N, n_classes)
+        try:
+            metrics["roc_auc"] = float(
+                roc_auc_score(y_true_np, y_prob_np, multi_class="ovr", average="macro")
+            )
+        except ValueError:
+            metrics["roc_auc"] = 0.0
+        metrics["pr_auc"] = 0.0  # not well-defined for multi-class
 
     return metrics
 
 
-def build_model(input_dims: int, config: GraphTrainConfig) -> nn.Module:
+def build_model(input_dims: int, config: GraphTrainConfig, n_classes: int = 2) -> nn.Module:
+    output_dims = 1 if n_classes == 2 else n_classes
+
+    if config.model_type == "qgat":
+        return QGAT(
+            input_dims=input_dims,
+            q_depths=list(config.q_depths),
+            output_dims=output_dims,
+            attn_dropout=config.attn_dropout,
+            layer_dropout=config.attn_dropout,
+            max_qubits=config.n_qubits or 8,
+            pool_type=config.pool_type,
+            use_mlp_head=config.use_mlp_head,
+            mlp_hidden=config.mlp_hidden,
+            mlp_dropout=config.mlp_dropout,
+            use_residual=config.use_residual,
+        )
+
     return QGCN(
         input_dims=input_dims,
         q_depths=list(config.q_depths),
-        output_dims=1,
+        output_dims=output_dims,
         activ_fn=LeakyReLU(0.2),
         readout=False,
         n_qubits=config.n_qubits,
+        pool_type=config.pool_type,
+        use_mlp_head=config.use_mlp_head,
+        mlp_hidden=config.mlp_hidden,
+        mlp_dropout=config.mlp_dropout,
+        use_residual=config.use_residual,
+        use_strongly_entangling=config.use_strongly_entangling,
     )
 
 
+def split_quantum_classical_params(
+    model: nn.Module,
+) -> Tuple[List[nn.Parameter], List[nn.Parameter]]:
+    """Separate the trainable quantum-circuit weights from classical params.
+
+    PennyLane's ``TorchLayer`` registers its rotation angles as
+    ``quantum_layer.weights`` inside ``QuantumCircuitAdapter`` instances.
+    Those tensors are tiny (n_layers x n_qubits = 16 scalars by default)
+    and live on a much noisier loss surface than the surrounding Linear
+    layers because every Q-Drop pruning step masks a fraction of their
+    gradient. Splitting them into their own optimizer group lets the
+    trainer dial in a lower learning rate without slowing the classical
+    encoder / classifier.
+    """
+    quantum_params: List[nn.Parameter] = []
+    classical_params: List[nn.Parameter] = []
+    for name, parameter in model.named_parameters():
+        if not parameter.requires_grad:
+            continue
+        if "quantum_layer.weights" in name or name.endswith(".quantum_layer.weights"):
+            quantum_params.append(parameter)
+        else:
+            classical_params.append(parameter)
+    return quantum_params, classical_params
+
+
 def build_optimizer(model: nn.Module, config: GraphTrainConfig) -> optim.Optimizer:
+    quantum_params, classical_params = split_quantum_classical_params(model)
+    quantum_lr = config.lr * float(config.quantum_lr_scale)
+
+    if quantum_params:
+        param_groups: List[Dict] = [
+            {"params": classical_params, "lr": config.lr, "name": "classical"},
+            {"params": quantum_params, "lr": quantum_lr, "name": "quantum"},
+        ]
+    else:
+        param_groups = [
+            {"params": classical_params, "lr": config.lr, "name": "classical"},
+        ]
+
     if config.weight_decay > 0:
-        return optim.AdamW(model.parameters(), lr=config.lr, weight_decay=config.weight_decay)
-    return optim.Adam(model.parameters(), lr=config.lr)
+        return optim.AdamW(param_groups, lr=config.lr, weight_decay=config.weight_decay)
+    return optim.Adam(param_groups, lr=config.lr)
 
 
 def build_qdrop_manager(model: nn.Module, config: GraphTrainConfig):
@@ -251,6 +431,7 @@ def run_epoch(
     scheduler: Optional[OneCycleLR] = None,
     grad_clip: float = 1.0,
     qdrop_manager: Optional[TorchQDropRuntime] = None,
+    n_classes: int = 2,
 ) -> Tuple[float, Dict[str, float]]:
     is_train = optimizer is not None
     model.train(is_train)
@@ -264,7 +445,7 @@ def run_epoch(
     total_loss = 0.0
     all_labels: List[int] = []
     all_preds: List[int] = []
-    all_probs: List[float] = []
+    all_probs: List = []
 
     context = torch.enable_grad() if is_train else torch.no_grad()
     with context:
@@ -273,11 +454,21 @@ def run_epoch(
             if is_train:
                 optimizer.zero_grad(set_to_none=True)
             logits = model(batch.x, batch.edge_index, batch.batch)
-            if logits.dim() > 1 and logits.size(1) == 1:
-                logits = logits.squeeze(1)
 
-            target = batch.y.float()
-            loss = criterion(logits, target)
+            if n_classes == 2:
+                if logits.dim() > 1 and logits.size(1) == 1:
+                    logits = logits.squeeze(1)
+                target = batch.y.float()
+                loss = criterion(logits, target)
+                probs = torch.sigmoid(logits)
+                preds = (probs > 0.5).long()
+                batch_probs = probs.detach().cpu().tolist()
+            else:
+                target = batch.y.long()
+                loss = criterion(logits, target)
+                probs = F.softmax(logits, dim=1)
+                preds = torch.argmax(probs, dim=1)
+                batch_probs = probs.detach().cpu().tolist()  # List[List[float]]
 
             if is_train:
                 loss.backward()
@@ -291,15 +482,12 @@ def run_epoch(
                 if scheduler is not None:
                     scheduler.step()
 
-            probs = torch.sigmoid(logits)
-            preds = (probs > 0.5).long()
-
             total_loss += float(loss.item())
             all_labels.extend(target.long().cpu().tolist())
             all_preds.extend(preds.cpu().tolist())
-            all_probs.extend(probs.detach().cpu().tolist())
+            all_probs.extend(batch_probs)
 
-    return total_loss / max(len(loader), 1), compute_metrics(all_labels, all_preds, all_probs)
+    return total_loss / max(len(loader), 1), compute_metrics(all_labels, all_preds, all_probs, n_classes=n_classes)
 
 
 def train_fold(
@@ -309,25 +497,39 @@ def train_fold(
     device: torch.device,
     dataset_name: str,
     fold_idx: int,
+    n_classes: int = 2,
 ) -> Dict:
     train_loader = DataLoader(train_graphs, batch_size=config.batch_size, shuffle=True)
     test_loader = DataLoader(test_graphs, batch_size=config.batch_size, shuffle=False)
 
-    model = build_model(input_dims=train_graphs[0].x.size(1), config=config).to(device)
+    model = build_model(input_dims=train_graphs[0].x.size(1), config=config, n_classes=n_classes).to(device)
 
-    pos_weight = None
-    if config.use_class_weights:
-        labels = [int(graph.y.item()) for graph in train_graphs]
-        pos_weight = compute_class_weight(labels, device=device)
-
-    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    if n_classes == 2:
+        pos_weight = None
+        if config.use_class_weights:
+            labels = [int(graph.y.item()) for graph in train_graphs]
+            pos_weight = compute_class_weight(labels, device=device)
+        criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+    else:
+        criterion = nn.CrossEntropyLoss()
     optimizer = build_optimizer(model, config)
     scheduler = None
     if config.use_scheduler:
         total_steps = max(len(train_loader) * config.epochs, 1)
+        # OneCycleLR rescales every parameter group to the same ``max_lr``
+        # unless we hand it a list. With per-group quantum/classical learning
+        # rates we have to keep the quantum branch on the lower ramp so the
+        # smaller, noisier quantum gradient sees a proportionally smaller
+        # peak step.
+        classical_max_lr = config.lr * 5.0
+        max_lr_per_group = [
+            classical_max_lr if group.get("name") != "quantum"
+            else classical_max_lr * float(config.quantum_lr_scale)
+            for group in optimizer.param_groups
+        ]
         scheduler = OneCycleLR(
             optimizer,
-            max_lr=config.lr * 5.0,
+            max_lr=max_lr_per_group,
             total_steps=total_steps,
             pct_start=0.1,
             anneal_strategy="cos",
@@ -361,6 +563,7 @@ def train_fold(
             scheduler=scheduler,
             grad_clip=config.grad_clip,
             qdrop_manager=qdrop_manager,
+            n_classes=n_classes,
         )
         train_curve.append({"epoch": epoch, "loss": train_loss, **train_metrics})
 
@@ -377,6 +580,7 @@ def train_fold(
             criterion=criterion,
             device=device,
             qdrop_manager=qdrop_manager,
+            n_classes=n_classes,
         )
         val_curve.append({"epoch": epoch, "loss": val_loss, **val_metrics})
 
@@ -400,6 +604,7 @@ def train_fold(
         criterion=criterion,
         device=device,
         qdrop_manager=qdrop_manager,
+        n_classes=n_classes,
     )
     print(
         f"    Fold {fold_idx + 1} test: "
@@ -458,7 +663,16 @@ def serialize_result_payload(
             "dropout_prob": config.dropout_prob,
             "n_drop_wires": config.n_drop_wires,
             "enable_forward_mask": config.enable_forward_mask,
+            "quantum_lr_scale": config.quantum_lr_scale,
             "seed": config.seed,
+            "pool_type": config.pool_type,
+            "use_mlp_head": config.use_mlp_head,
+            "mlp_hidden": config.mlp_hidden,
+            "mlp_dropout": config.mlp_dropout,
+            "use_residual": config.use_residual,
+            "use_strongly_entangling": config.use_strongly_entangling,
+            "model_type": config.model_type,
+            "attn_dropout": config.attn_dropout,
         },
         "summary": aggregate_fold_results(fold_results),
         "folds": list(fold_results),
@@ -480,6 +694,49 @@ def train_dataset(
     dataset_key = normalize_dataset_name(dataset_name)
     dataset_spec = DATASET_SPECS[dataset_key]
 
+    # Apply per-dataset n_qubits override unless the operator pinned a
+    # width explicitly via --n-qubits. Keeps reproducibility intact while
+    # letting PROTEINS run on a wider circuit than MUTAG.
+    applied_nqubits_override = False
+    if config.n_qubits is None and dataset_key in DATASET_NQUBITS_OVERRIDES:
+        override = DATASET_NQUBITS_OVERRIDES[dataset_key]
+        config = replace(config, n_qubits=override)
+        applied_nqubits_override = True
+        print(f"  Per-dataset override: n_qubits -> {override}")
+
+    # When the wider quantum circuit is active, also shrink the graph
+    # batch so the simulator state fits in GPU memory. Only triggers when
+    # we picked the override above, so an explicit --n-qubits run keeps
+    # the operator-chosen batch size.
+    if applied_nqubits_override and dataset_key in DATASET_BATCHSIZE_OVERRIDES:
+        batch_override = DATASET_BATCHSIZE_OVERRIDES[dataset_key]
+        if config.batch_size > batch_override:
+            config = replace(config, batch_size=batch_override)
+            print(f"  Per-dataset override: batch_size -> {batch_override}")
+
+    # Apply per-dataset model architecture overrides (e.g. NCI1 gets
+    # multi-scale pooling + MLP head + StronglyEntanglingLayers). Gated on
+    # applied_nqubits_override so that explicit --n-qubits runs keep the
+    # operator-chosen architecture for reproducibility.
+    _MODEL_DEFAULT_SENTINELS = {
+        "pool_type": "mean",
+        "use_mlp_head": False,
+        "use_residual": False,
+        "use_strongly_entangling": False,
+    }
+    if applied_nqubits_override and dataset_key in DATASET_MODEL_OVERRIDES:
+        patch: Dict = {}
+        model_overrides = DATASET_MODEL_OVERRIDES[dataset_key]
+        for field, sentinel in _MODEL_DEFAULT_SENTINELS.items():
+            if getattr(config, field) == sentinel and field in model_overrides:
+                patch[field] = model_overrides[field]
+        for field in ("mlp_hidden", "mlp_dropout", "epochs", "early_stop_patience", "q_depths"):
+            if field in model_overrides:
+                patch[field] = model_overrides[field]
+        if patch:
+            config = replace(config, **patch)
+            print(f"  Per-dataset model overrides: {patch}")
+
     print("\n" + "=" * 72)
     print(f"Training QGCN on {dataset_spec.name}")
     print("=" * 72)
@@ -494,6 +751,7 @@ def train_dataset(
     splitter = StratifiedKFold(n_splits=config.n_folds, shuffle=True, random_state=config.seed)
     fold_results: List[Dict] = []
 
+    n_classes = dataset_spec.n_classes
     for fold_idx, (train_idx, test_idx) in enumerate(splitter.split(graphs, labels)):
         train_graphs = [graphs[index] for index in train_idx]
         test_graphs = [graphs[index] for index in test_idx]
@@ -505,6 +763,7 @@ def train_dataset(
                 device=device,
                 dataset_name=dataset_spec.name,
                 fold_idx=fold_idx,
+                n_classes=n_classes,
             )
         )
 
@@ -573,8 +832,22 @@ def build_train_parser(
     parser.add_argument("--drop-prob", type=float, default=0.5)
     parser.add_argument("--n-drop-wires", type=int, default=1)
     parser.add_argument("--disable-forward-mask", action="store_true")
+    parser.add_argument(
+        "--quantum-lr-scale",
+        type=float,
+        default=0.1,
+        help="Multiplier applied to --lr for the quantum parameter group (default 0.1)",
+    )
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--output-dir", type=str, default=default_output_dir)
+    parser.add_argument("--pool-type", type=str, default="mean", choices=["mean", "multiscale"])
+    parser.add_argument("--use-mlp-head", action="store_true", default=False)
+    parser.add_argument("--mlp-hidden", type=int, default=64)
+    parser.add_argument("--mlp-dropout", type=float, default=0.5)
+    parser.add_argument("--use-residual", action="store_true", default=False)
+    parser.add_argument("--use-strongly-entangling", action="store_true", default=False)
+    parser.add_argument("--model-type", type=str, default="qgcn", choices=["qgcn", "qgat"])
+    parser.add_argument("--attn-dropout", type=float, default=0.2)
     return parser
 
 
@@ -601,21 +874,55 @@ def config_from_args(args: argparse.Namespace) -> GraphTrainConfig:
         dropout_prob=args.drop_prob,
         n_drop_wires=args.n_drop_wires,
         enable_forward_mask=not args.disable_forward_mask,
+        quantum_lr_scale=args.quantum_lr_scale,
         output_dir=args.output_dir,
         seed=args.seed,
+        pool_type=args.pool_type,
+        use_mlp_head=args.use_mlp_head,
+        mlp_hidden=args.mlp_hidden,
+        mlp_dropout=args.mlp_dropout,
+        use_residual=args.use_residual,
+        use_strongly_entangling=args.use_strongly_entangling,
+        model_type=args.model_type,
+        attn_dropout=args.attn_dropout,
     )
+
+
+def select_cuda_device(preferred_index: int = 1) -> torch.device:
+    """Pick a CUDA device, preferring ``preferred_index`` when available.
+
+    The Q-Drop training rigs ship with dual RTX PRO 6000 cards. GPU 0 is
+    usually shared with display / Isaac Sim, so the trainer prefers GPU 1
+    when it exists and is visible. Falls back to GPU 0, then CPU, so the
+    same code path runs on single-GPU dev boxes and CI runners without
+    changes. Respects ``CUDA_VISIBLE_DEVICES``: if the operator pinned a
+    single device, ``torch.cuda.device_count()`` already reports 1 and we
+    quietly use the only visible card.
+    """
+    if not torch.cuda.is_available():
+        return torch.device("cpu")
+    device_count = torch.cuda.device_count()
+    if device_count > preferred_index:
+        return torch.device(f"cuda:{preferred_index}")
+    return torch.device("cuda:0")
 
 
 def run_experiments(config: GraphTrainConfig) -> Tuple[Path, Dict[str, Dict]]:
     set_seed(config.seed)
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    device = select_cuda_device(preferred_index=1)
+    if device.type == "cuda":
+        torch.cuda.set_device(device)
 
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     base_output = Path(config.output_dir) / f"quantum_graph_training_{timestamp}"
     base_output.mkdir(parents=True, exist_ok=True)
 
     print("Unified quantum training started")
-    print(f"Device: {device}")
+    if device.type == "cuda":
+        gpu_name = torch.cuda.get_device_name(device)
+        print(f"Device: {device} ({gpu_name})")
+    else:
+        print(f"Device: {device}")
     print(f"Datasets: {[dataset.upper() for dataset in config.datasets]}")
     print(f"Algorithm: {config.algorithm}")
     print(f"Output: {base_output.resolve()}")
