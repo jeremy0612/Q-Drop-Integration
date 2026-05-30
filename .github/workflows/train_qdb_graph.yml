@@ -13,7 +13,7 @@ name: QDB Graph Training — MUTAG & PROTEINS (Q-Drop algos only)
 
 on:
   push:
-    branches: [feat/torch_qdrop, feat/qdb]
+    branches: [feat/diffusion_block]
     paths:
       - "src/qdb/**"
       - "src/train_qdb.py"
