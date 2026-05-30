@@ -1,0 +1,320 @@
+name: QDB Graph Training — MUTAG & PROTEINS (Q-Drop algos only)
+
+# Orchestration plan (QDB = Quantum-Diffusion-Block; NO baseline job):
+#
+#   train-qdb-pruning   (A6000) ──► report-qdb-pruning (A6000)
+#   train-qdb-dropout   (P6000) ──► report-qdb-dropout (A6000)
+#                                          │
+#                                          └──► train-qdb-both (P6000) ──► report-qdb-both (A6000)
+#
+# QDB uses its own sticky CML watermarks ("QDB training — ...") so they do
+# not collide with the existing "Q-Drop training — ..." comments from
+# train_quantum_graph.yml.
+
+on:
+  push:
+    branches: [feat/torch_qdrop, feat/qdb]
+    paths:
+      - "src/qdb/**"
+      - "src/train_qdb.py"
+      - "src/models/**"
+      - "src/qdrop/**"
+      - "src/data/**"
+      - "data_loader/**"
+      - "scripts/generate_cml_report.py"
+      - ".github/workflows/train_qdb_graph.yml"
+      - ".github/workflows/_train_qdb_one.yml"
+  pull_request:
+    branches: [feat/torch_qdrop, feat/qdb]
+    paths:
+      - "src/qdb/**"
+      - "src/train_qdb.py"
+      - ".github/workflows/train_qdb_graph.yml"
+      - ".github/workflows/_train_qdb_one.yml"
+  workflow_dispatch:
+    inputs:
+      epochs:
+        description: "Max training epochs per fold"
+        required: false
+        default: "100"
+      n_qubits:
+        description: "Quantum tensor width override: 8 or 16"
+        required: false
+        default: "16"
+      n_blocks:
+        description: "Number of QDB blocks"
+        required: false
+        default: "2"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  train-qdb-pruning:
+    name: QDB Train (pruning, A6000)
+    uses: ./.github/workflows/_train_qdb_one.yml
+    secrets: inherit
+    with:
+      algorithm: pruning
+      n_blocks: ${{ github.event.inputs.n_blocks || '2' }}
+      runner-labels: '["self-hosted","A6000"]'
+      epochs: ${{ github.event.inputs.epochs || '100' }}
+      n_qubits: ${{ github.event.inputs.n_qubits || '16' }}
+      post-cml-comment: false
+      watermark-title: "QDB training — pruning"
+      artifact-suffix: pruning
+
+  report-qdb-pruning:
+    name: QDB Report (pruning, A6000)
+    needs: train-qdb-pruning
+    runs-on: [self-hosted, A6000]
+    if: always() && needs.train-qdb-pruning.result == 'success'
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      ALGORITHM: pruning
+      WATERMARK_TITLE: "QDB training — pruning"
+      OUTPUT_DIR: ci_results
+      MPLCONFIGDIR: /tmp/matplotlib
+    steps:
+      - name: Add npm global bin to PATH
+        run: echo "$HOME/.npm-global/bin" >> $GITHUB_PATH
+      - uses: actions/checkout@v4
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Install report-only deps
+        run: |
+          pip install --upgrade pip
+          pip install "matplotlib>=3.7.0" "numpy>=1.24.0"
+      - name: Download pruning training artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: qdb-graph-metrics-pruning-${{ github.run_id }}
+          path: artifact-pruning
+      - name: Stage results for the report script
+        id: stage
+        run: |
+          mkdir -p "$OUTPUT_DIR"
+          if [ -d artifact-pruning/ci_results ]; then
+            cp -r artifact-pruning/ci_results/* "$OUTPUT_DIR"/
+          else
+            cp -r artifact-pruning/* "$OUTPUT_DIR"/ 2>/dev/null || true
+          fi
+          RESULTS_DIR=$(ls -dt "$OUTPUT_DIR"/qdb_training_* 2>/dev/null | head -1)
+          if [ -z "$RESULTS_DIR" ]; then
+            echo "ERROR: pruning artifact did not contain a qdb_training_* directory"
+            ls -R artifact-pruning
+            exit 1
+          fi
+          echo "RESULTS_DIR=$RESULTS_DIR" >> "$GITHUB_ENV"
+          echo "results-dir=$RESULTS_DIR" >> "$GITHUB_OUTPUT"
+          ls -lah "$RESULTS_DIR"
+      - name: Generate CML report (pruning)
+        env:
+          REPORT_INCLUDE_INLINE_ASSETS: "true"
+          REPORT_PATH: report.md
+          BASELINE_PATH: quantum_graph_baseline.json
+        run: |
+          python scripts/generate_cml_report.py || \
+            echo "WARN: report generation failed for QDB summary; posting raw notice"
+      - name: Post / update CML comment (pruning)
+        env:
+          REPO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cml ci
+          cml comment update --watermark-title="$WATERMARK_TITLE" report.md || \
+            echo "WARN: cml post failed"
+      - name: Re-upload pruning report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: qdb-graph-metrics-pruning-final-${{ github.run_id }}
+          path: |
+            ${{ steps.stage.outputs.results-dir }}/summary.json
+            ${{ steps.stage.outputs.results-dir }}/report_assets/*.png
+            report.md
+          retention-days: 30
+          if-no-files-found: warn
+
+  train-qdb-dropout:
+    name: QDB Train (dropout, P6000)
+    uses: ./.github/workflows/_train_qdb_one.yml
+    secrets: inherit
+    with:
+      algorithm: dropout
+      n_blocks: ${{ github.event.inputs.n_blocks || '2' }}
+      runner-labels: '["self-hosted","P6000"]'
+      epochs: ${{ github.event.inputs.epochs || '100' }}
+      n_qubits: ${{ github.event.inputs.n_qubits || '16' }}
+      post-cml-comment: false
+      watermark-title: "QDB training — dropout"
+      artifact-suffix: dropout
+
+  report-qdb-dropout:
+    name: QDB Report (dropout, A6000)
+    needs: train-qdb-dropout
+    runs-on: [self-hosted, A6000]
+    if: always() && needs.train-qdb-dropout.result == 'success'
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      ALGORITHM: dropout
+      WATERMARK_TITLE: "QDB training — dropout"
+      OUTPUT_DIR: ci_results
+      MPLCONFIGDIR: /tmp/matplotlib
+    steps:
+      - name: Add npm global bin to PATH
+        run: echo "$HOME/.npm-global/bin" >> $GITHUB_PATH
+      - uses: actions/checkout@v4
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Install report-only deps
+        run: |
+          pip install --upgrade pip
+          pip install "matplotlib>=3.7.0" "numpy>=1.24.0"
+      - name: Download dropout training artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: qdb-graph-metrics-dropout-${{ github.run_id }}
+          path: artifact-dropout
+      - name: Stage results for the report script
+        id: stage
+        run: |
+          mkdir -p "$OUTPUT_DIR"
+          if [ -d artifact-dropout/ci_results ]; then
+            cp -r artifact-dropout/ci_results/* "$OUTPUT_DIR"/
+          else
+            cp -r artifact-dropout/* "$OUTPUT_DIR"/ 2>/dev/null || true
+          fi
+          RESULTS_DIR=$(ls -dt "$OUTPUT_DIR"/qdb_training_* 2>/dev/null | head -1)
+          if [ -z "$RESULTS_DIR" ]; then
+            echo "ERROR: dropout artifact did not contain a qdb_training_* directory"
+            ls -R artifact-dropout
+            exit 1
+          fi
+          echo "RESULTS_DIR=$RESULTS_DIR" >> "$GITHUB_ENV"
+          echo "results-dir=$RESULTS_DIR" >> "$GITHUB_OUTPUT"
+          ls -lah "$RESULTS_DIR"
+      - name: Generate CML report (dropout)
+        env:
+          REPORT_INCLUDE_INLINE_ASSETS: "true"
+          REPORT_PATH: report.md
+          BASELINE_PATH: quantum_graph_baseline.json
+        run: |
+          python scripts/generate_cml_report.py || \
+            echo "WARN: report generation failed for QDB summary; posting raw notice"
+      - name: Post / update CML comment (dropout)
+        env:
+          REPO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cml ci
+          cml comment update --watermark-title="$WATERMARK_TITLE" report.md || \
+            echo "WARN: cml post failed"
+      - name: Re-upload dropout report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: qdb-graph-metrics-dropout-final-${{ github.run_id }}
+          path: |
+            ${{ steps.stage.outputs.results-dir }}/summary.json
+            ${{ steps.stage.outputs.results-dir }}/report_assets/*.png
+            report.md
+          retention-days: 30
+          if-no-files-found: warn
+
+  train-qdb-both:
+    name: QDB Train (both, P6000)
+    needs: [report-qdb-pruning, report-qdb-dropout]
+    uses: ./.github/workflows/_train_qdb_one.yml
+    secrets: inherit
+    with:
+      algorithm: both
+      n_blocks: ${{ github.event.inputs.n_blocks || '2' }}
+      runner-labels: '["self-hosted","P6000"]'
+      epochs: ${{ github.event.inputs.epochs || '100' }}
+      n_qubits: ${{ github.event.inputs.n_qubits || '16' }}
+      post-cml-comment: false
+      watermark-title: "QDB training — both"
+      artifact-suffix: both
+
+  report-qdb-both:
+    name: QDB Report (both, A6000)
+    needs: train-qdb-both
+    runs-on: [self-hosted, A6000]
+    if: always() && needs.train-qdb-both.result == 'success'
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      ALGORITHM: both
+      WATERMARK_TITLE: "QDB training — both"
+      OUTPUT_DIR: ci_results
+      MPLCONFIGDIR: /tmp/matplotlib
+    steps:
+      - name: Add npm global bin to PATH
+        run: echo "$HOME/.npm-global/bin" >> $GITHUB_PATH
+      - uses: actions/checkout@v4
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+      - name: Install report-only deps
+        run: |
+          pip install --upgrade pip
+          pip install "matplotlib>=3.7.0" "numpy>=1.24.0"
+      - name: Download both training artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: qdb-graph-metrics-both-${{ github.run_id }}
+          path: artifact-both
+      - name: Stage results for the report script
+        id: stage
+        run: |
+          mkdir -p "$OUTPUT_DIR"
+          if [ -d artifact-both/ci_results ]; then
+            cp -r artifact-both/ci_results/* "$OUTPUT_DIR"/
+          else
+            cp -r artifact-both/* "$OUTPUT_DIR"/ 2>/dev/null || true
+          fi
+          RESULTS_DIR=$(ls -dt "$OUTPUT_DIR"/qdb_training_* 2>/dev/null | head -1)
+          if [ -z "$RESULTS_DIR" ]; then
+            echo "ERROR: both artifact did not contain a qdb_training_* directory"
+            ls -R artifact-both
+            exit 1
+          fi
+          echo "RESULTS_DIR=$RESULTS_DIR" >> "$GITHUB_ENV"
+          echo "results-dir=$RESULTS_DIR" >> "$GITHUB_OUTPUT"
+          ls -lah "$RESULTS_DIR"
+      - name: Generate CML report (both)
+        env:
+          REPORT_INCLUDE_INLINE_ASSETS: "true"
+          REPORT_PATH: report.md
+          BASELINE_PATH: quantum_graph_baseline.json
+        run: |
+          python scripts/generate_cml_report.py || \
+            echo "WARN: report generation failed for QDB summary; posting raw notice"
+      - name: Post / update CML comment (both)
+        env:
+          REPO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cml ci
+          cml comment update --watermark-title="$WATERMARK_TITLE" report.md || \
+            echo "WARN: cml post failed"
+      - name: Re-upload both report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: qdb-graph-metrics-both-final-${{ github.run_id }}
+          path: |
+            ${{ steps.stage.outputs.results-dir }}/summary.json
+            ${{ steps.stage.outputs.results-dir }}/report_assets/*.png
+            report.md
+          retention-days: 30
+          if-no-files-found: warn
