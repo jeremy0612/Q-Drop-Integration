@@ -34,17 +34,25 @@ on:
   workflow_dispatch:
     inputs:
       epochs:
-        description: "Max training epochs per fold"
+        description: "Max training epochs per fold (smoke=20, full=100)"
         required: false
-        default: "100"
+        default: "20"
       n_qubits:
-        description: "Quantum tensor width override: 8 or 16"
+        description: "Quantum tensor width override: 4, 8, or 16 (smoke=8, full=16)"
         required: false
-        default: "16"
+        default: "8"
       n_blocks:
         description: "Number of QDB blocks"
         required: false
         default: "2"
+      folds:
+        description: "Cross-validation folds (smoke=3, full=10)"
+        required: false
+        default: "3"
+      batch_size:
+        description: "Graphs per batch (smoke=8 for n_qubits=16, else 16)"
+        required: false
+        default: "16"
 
 permissions:
   contents: write
@@ -59,8 +67,10 @@ jobs:
       algorithm: pruning
       n_blocks: ${{ github.event.inputs.n_blocks || '2' }}
       runner-labels: '["self-hosted","A6000"]'
-      epochs: ${{ github.event.inputs.epochs || '100' }}
-      n_qubits: ${{ github.event.inputs.n_qubits || '16' }}
+      epochs: ${{ github.event.inputs.epochs || '20' }}
+      n_qubits: ${{ github.event.inputs.n_qubits || '8' }}
+      folds: ${{ github.event.inputs.folds || '3' }}
+      batch_size: ${{ github.event.inputs.batch_size || '16' }}
       post-cml-comment: false
       watermark-title: "QDB training — pruning"
       artifact-suffix: pruning
@@ -148,8 +158,10 @@ jobs:
       algorithm: dropout
       n_blocks: ${{ github.event.inputs.n_blocks || '2' }}
       runner-labels: '["self-hosted","P6000"]'
-      epochs: ${{ github.event.inputs.epochs || '100' }}
-      n_qubits: ${{ github.event.inputs.n_qubits || '16' }}
+      epochs: ${{ github.event.inputs.epochs || '20' }}
+      n_qubits: ${{ github.event.inputs.n_qubits || '8' }}
+      folds: ${{ github.event.inputs.folds || '3' }}
+      batch_size: ${{ github.event.inputs.batch_size || '16' }}
       post-cml-comment: false
       watermark-title: "QDB training — dropout"
       artifact-suffix: dropout
@@ -238,8 +250,10 @@ jobs:
       algorithm: both
       n_blocks: ${{ github.event.inputs.n_blocks || '2' }}
       runner-labels: '["self-hosted","P6000"]'
-      epochs: ${{ github.event.inputs.epochs || '100' }}
-      n_qubits: ${{ github.event.inputs.n_qubits || '16' }}
+      epochs: ${{ github.event.inputs.epochs || '20' }}
+      n_qubits: ${{ github.event.inputs.n_qubits || '8' }}
+      folds: ${{ github.event.inputs.folds || '3' }}
+      batch_size: ${{ github.event.inputs.batch_size || '16' }}
       post-cml-comment: false
       watermark-title: "QDB training — both"
       artifact-suffix: both

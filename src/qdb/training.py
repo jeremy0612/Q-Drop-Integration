@@ -4,13 +4,20 @@ from __future__ import annotations
 
 import math
 import random
+import time
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Sequence, Tuple
+from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.optim as optim
+
+try:
+    from tqdm import tqdm
+except ImportError:  # tqdm absent in some lightweight envs
+    def tqdm(iterable, **kwargs):
+        return iterable
 
 from qdb.models import QDBGCN
 from qdb.noise_schedule import edm_weight, sample_sigma_in_block
@@ -33,6 +40,10 @@ class QDBTrainConfig:
     sigma_data: float = 0.5
     algorithm: str = "pruning"  # pruning | dropout | both — no baseline
     seed: int = 42
+    # Wall-time guard: abort if a single train_one_step takes longer than
+    # this many seconds. Default 600s (10 min). 0 disables. Catches runaway
+    # quantum-sim backends without burning runner hours.
+    step_timeout_seconds: float = 600.0
 
 
 def score_matching_loss(
@@ -146,8 +157,15 @@ def train_qdb(
     val_loader,
     config: QDBTrainConfig,
     device: torch.device,
+    epoch_callback: Optional[Callable[[int, Dict], None]] = None,
+    desc: str = "qdb",
 ) -> Dict:
     """Drive the full training loop: per-step random block selection.
+
+    Args:
+        epoch_callback: optional fn(epoch, history) called after each epoch
+            for incremental persistence / progress reporting.
+        desc: short string used in tqdm progress bar.
 
     Returns a summary dict with per-block loss curves and val accuracy history.
     """
@@ -161,7 +179,8 @@ def train_qdb(
         "config": vars(config),
     }
 
-    for epoch in range(1, config.epochs + 1):
+    epoch_iter = tqdm(range(1, config.epochs + 1), desc=desc, leave=False)
+    for epoch in epoch_iter:
         epoch_block_losses: List[List[float]] = [[] for _ in range(model.n_blocks)]
         for graph_batch in train_loader:
             graph_batch = graph_batch.to(device)
@@ -169,6 +188,7 @@ def train_qdb(
             if optimizers[b] is None:
                 continue
             labels = graph_batch.y.view(-1).long()
+            step_t0 = time.perf_counter()
             loss = train_one_step(
                 model=model,
                 block_idx=b,
@@ -180,6 +200,14 @@ def train_qdb(
                 config=config,
                 rng=rng_np,
             )
+            step_dt = time.perf_counter() - step_t0
+            if config.step_timeout_seconds and step_dt > config.step_timeout_seconds:
+                raise TimeoutError(
+                    f"train_one_step exceeded {config.step_timeout_seconds:.0f}s "
+                    f"(actual {step_dt:.1f}s) at epoch {epoch}, block {b}. "
+                    f"Likely a quantum backend regression. Set "
+                    f"QDB_QUANTUM_BACKEND=lightning or lower n_qubits/batch_size."
+                )
             epoch_block_losses[b].append(loss)
         for b in range(model.n_blocks):
             avg = float(np.mean(epoch_block_losses[b])) if epoch_block_losses[b] else float("nan")
@@ -187,4 +215,18 @@ def train_qdb(
         if val_loader is not None:
             val_metrics = evaluate(model, val_loader, device)
             history["val_accuracy"].append(val_metrics["accuracy"])
+        # Lightweight per-epoch tqdm summary so the runner log shows progress.
+        summary_bits = []
+        for b, losses in enumerate(history["block_loss"]):
+            if losses:
+                summary_bits.append(f"b{b}={losses[-1]:.3f}")
+        if history["val_accuracy"]:
+            summary_bits.append(f"val={history['val_accuracy'][-1]:.3f}")
+        try:
+            epoch_iter.set_postfix_str(" ".join(summary_bits))
+        except AttributeError:
+            # tqdm fallback (plain iterable) doesn't have set_postfix_str.
+            print(f"[{desc}] epoch {epoch}: " + " ".join(summary_bits), flush=True)
+        if epoch_callback is not None:
+            epoch_callback(epoch, history)
     return history

@@ -17,10 +17,23 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List
 
+# Cap CPU thread pools BEFORE importing torch/numpy/pennylane. PennyLane,
+# numpy/scipy (via OpenMP/MKL) and PyTorch each spawn their own thread pool
+# of size=nproc by default. Without caps a 16-qubit training run on a
+# 32-core runner produces 100+ threads fighting for the GIL, near-zero
+# parallelism, and 100% CPU but no forward progress.
+os.environ.setdefault("OMP_NUM_THREADS", "1")
+os.environ.setdefault("MKL_NUM_THREADS", "1")
+os.environ.setdefault("OPENBLAS_NUM_THREADS", "1")
+os.environ.setdefault("NUMEXPR_NUM_THREADS", "1")
+
 import numpy as np
 import torch
 from sklearn.model_selection import StratifiedKFold
 from torch_geometric.loader import DataLoader
+
+torch.set_num_threads(1)
+torch.set_num_interop_threads(1)
 
 _SRC = os.path.dirname(os.path.abspath(__file__))
 if _SRC not in sys.path:
@@ -112,6 +125,9 @@ def train_dataset(
     splitter = StratifiedKFold(n_splits=config.n_folds, shuffle=True, random_state=config.seed)
     fold_results: List[Dict] = []
 
+    dataset_dir = output_dir / dataset_key
+    dataset_dir.mkdir(parents=True, exist_ok=True)
+
     for fold_idx, (train_idx, test_idx) in enumerate(splitter.split(graphs, labels)):
         train_graphs = [graphs[i] for i in train_idx]
         test_graphs = [graphs[i] for i in test_idx]
@@ -119,17 +135,58 @@ def train_dataset(
         test_loader = DataLoader(test_graphs, batch_size=config.batch_size, shuffle=False)
 
         model = build_model(model_type, config.n_blocks, in_channels, n_qubits, n_classes).to(device)
-        history = train_qdb(model, train_loader, test_loader, config, device)
-        final = evaluate(model, test_loader, device)
-        print(f"  fold {fold_idx + 1}: accuracy={final['accuracy']:.4f}")
-        fold_results.append(
-            {
-                "fold": fold_idx + 1,
-                "accuracy": final["accuracy"],
-                "block_loss": history["block_loss"],
-                "val_accuracy_curve": history["val_accuracy"],
-            }
+
+        # Incremental per-epoch checkpoint so operators see progress before
+        # all folds complete. Without this, a 100-epoch x 10-fold run on a
+        # 16-qubit circuit emits zero artifacts for hours.
+        epoch_checkpoint_path = dataset_dir / f"fold_{fold_idx + 1}_epoch_progress.json"
+
+        def _on_epoch(epoch: int, hist: Dict) -> None:
+            with open(epoch_checkpoint_path, "w") as fh:
+                json.dump(
+                    {
+                        "dataset": spec.name,
+                        "fold": fold_idx + 1,
+                        "epoch": epoch,
+                        "block_loss": hist["block_loss"],
+                        "val_accuracy_curve": hist["val_accuracy"],
+                    },
+                    fh,
+                    indent=2,
+                )
+
+        history = train_qdb(
+            model,
+            train_loader,
+            test_loader,
+            config,
+            device,
+            epoch_callback=_on_epoch,
+            desc=f"{spec.name}/f{fold_idx + 1}",
         )
+        final = evaluate(model, test_loader, device)
+        print(f"  fold {fold_idx + 1}: accuracy={final['accuracy']:.4f}", flush=True)
+        fold_result = {
+            "fold": fold_idx + 1,
+            "accuracy": final["accuracy"],
+            "block_loss": history["block_loss"],
+            "val_accuracy_curve": history["val_accuracy"],
+        }
+        fold_results.append(fold_result)
+
+        # Persist after every fold — operators can inspect partial progress
+        # without waiting for all 10 folds.
+        with open(dataset_dir / f"fold_{fold_idx + 1}.json", "w") as fh:
+            json.dump(fold_result, fh, indent=2)
+        running_summary = {
+            "timestamp": datetime.now().isoformat(),
+            "dataset": spec.name,
+            "completed_folds": len(fold_results),
+            "fold_results": fold_results,
+            "mean_accuracy_so_far": float(np.mean([r["accuracy"] for r in fold_results])),
+        }
+        with open(dataset_dir / "metrics.json", "w") as fh:
+            json.dump(running_summary, fh, indent=2)
 
     summary = {
         "timestamp": datetime.now().isoformat(),
@@ -143,8 +200,6 @@ def train_dataset(
         "mean_accuracy": float(np.mean([r["accuracy"] for r in fold_results])),
         "std_accuracy": float(np.std([r["accuracy"] for r in fold_results])),
     }
-    dataset_dir = output_dir / dataset_key
-    dataset_dir.mkdir(parents=True, exist_ok=True)
     with open(dataset_dir / "metrics.json", "w") as f:
         json.dump(summary, f, indent=2)
     return summary

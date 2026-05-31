@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import os
+
 import pennylane as qml
 import torch
 import torch.nn as nn
@@ -10,13 +12,38 @@ from qdrop.specs.pennylane_torch import PennyLaneTorchSpecFactory
 from qdrop.types import QDropDropoutState
 
 
-def _select_device_and_diff(n_qubits: int):
-    """Return (device, diff_method) using the fastest available backend.
+# Threshold at which default.qubit + backprop stops being competitive. At
+# n_qubits >= 12 the state vector (2^n complex64) broadcast across PyG's
+# batched ~600-node tensors crosses ~1 GB per intermediate, and backprop
+# stores every intermediate -> tens of GB per training step. Switching to
+# lightning.qubit + adjoint differentiation drops backward memory to O(1)
+# in circuit depth at the cost of CPU-only simulation. Empirically much
+# faster than burning hours in default.qubit + GPU OOM thrash.
+_BACKEND_SWITCH_NQUBITS = 12
 
-    default.qubit + backprop delegates gradient computation to PyTorch autograd.
-    When the model is on GPU, all state-vector ops run as CUDA tensor operations,
-    giving ~100x speedup over C++ CPU simulators with tape-based gradients.
+
+def _select_device_and_diff(n_qubits: int):
+    """Return (device, diff_method) auto-selected by qubit count.
+
+    - n_qubits < 12: default.qubit + backprop. State vector fits, GPU autograd
+      is fastest.
+    - n_qubits >= 12: lightning.qubit + adjoint differentiation. C++ CPU
+      backend, O(1) memory in circuit depth, no intermediate storage.
+    - Override via env var QDB_QUANTUM_BACKEND=lightning|default to force.
     """
+    override = os.environ.get("QDB_QUANTUM_BACKEND", "").lower().strip()
+    use_lightning = (
+        override == "lightning"
+        or (override != "default" and n_qubits >= _BACKEND_SWITCH_NQUBITS)
+    )
+
+    if use_lightning:
+        try:
+            return qml.device("lightning.qubit", wires=n_qubits), "adjoint"
+        except qml.DeviceError:
+            # pennylane-lightning not installed; fall through to default.qubit.
+            pass
+
     return qml.device("default.qubit", wires=n_qubits), "backprop"
 
 

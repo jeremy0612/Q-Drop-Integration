@@ -23,6 +23,14 @@ on:
         description: "Quantum tensor width override (8 or 16)"
         type: string
         default: ""
+      folds:
+        description: "Cross-validation folds"
+        type: string
+        default: "3"
+      batch_size:
+        description: "Graphs per batch"
+        type: string
+        default: "16"
       post-cml-comment:
         description: "Whether to post a CML comment from this job"
         type: boolean
@@ -51,7 +59,17 @@ jobs:
       EPOCHS: ${{ inputs.epochs }}
       N_QUBITS: ${{ inputs.n_qubits }}
       N_BLOCKS: ${{ inputs.n_blocks }}
+      FOLDS: ${{ inputs.folds }}
+      BATCH_SIZE: ${{ inputs.batch_size }}
       WATERMARK_TITLE: ${{ inputs.watermark-title }}
+      # Prefer lightning.qubit + adjoint at n_qubits>=12 (set in code, but
+      # honored by env override). Cap thread pools so 16-qubit runs do not
+      # explode into 100+ threads on a 32-core runner.
+      QDB_QUANTUM_BACKEND: auto
+      OMP_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
+      NUMEXPR_NUM_THREADS: "1"
 
     steps:
       - name: Add npm global bin to PATH
@@ -192,6 +210,9 @@ jobs:
           echo "QDB algorithm    : $ALGORITHM"
           echo "QDB n_blocks     : $N_BLOCKS"
           echo "Max epochs       : $EPOCHS"
+          echo "Folds            : $FOLDS"
+          echo "Batch size       : $BATCH_SIZE"
+          echo "Quantum backend  : $QDB_QUANTUM_BACKEND"
           if [ -n "$N_QUBITS" ]; then
             echo "Quantum width    : $N_QUBITS"
             python src/train_qdb.py \
@@ -200,7 +221,8 @@ jobs:
               --algorithm "$ALGORITHM" \
               --n-blocks "$N_BLOCKS" \
               --n-qubits "$N_QUBITS" \
-              --batch-size 16 \
+              --batch-size "$BATCH_SIZE" \
+              --folds "$FOLDS" \
               --output-dir "$OUTPUT_DIR" \
               --seed 42
           else
@@ -209,6 +231,8 @@ jobs:
               --epochs "$EPOCHS" \
               --algorithm "$ALGORITHM" \
               --n-blocks "$N_BLOCKS" \
+              --batch-size "$BATCH_SIZE" \
+              --folds "$FOLDS" \
               --output-dir "$OUTPUT_DIR" \
               --seed 42
           fi
