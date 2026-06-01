@@ -1,5 +1,8 @@
 name: PROTEINS Experiment - QGCN Graph Classification
 
+# Train + report split (mirrors train_quantum_graph.yml topology):
+#   train-proteins   (A6000)  ──► report-proteins (A6000)
+
 on:
   push:
     branches: [main]
@@ -7,15 +10,32 @@ on:
       - 'src/train_proteins.py'
       - 'src/data/load_proteins.py'
       - 'src/models/**'
+      - 'src/training/**'
+      - 'src/qdrop/**'
       - '.github/workflows/proteins.yml'
   workflow_dispatch:
+    inputs:
+      epochs:
+        description: "Max training epochs per fold"
+        required: false
+        default: "100"
+
+permissions:
+  contents: write
+  pull-requests: write
 
 jobs:
-  proteins:
-    runs-on: [A6000]
+  train-proteins:
+    name: Train PROTEINS (A6000)
+    runs-on: [self-hosted, A6000]
     permissions:
       contents: write
       pull-requests: write
+    env:
+      EPOCHS: ${{ github.event.inputs.epochs || '100' }}
+      OMP_NUM_THREADS: "1"
+      MKL_NUM_THREADS: "1"
+      OPENBLAS_NUM_THREADS: "1"
 
     steps:
       - name: Add npm global bin to PATH
@@ -28,139 +48,171 @@ jobs:
           if [ -n "$CUDA_LIB" ]; then
             echo "LD_LIBRARY_PATH=${CUDA_LIB}:${LD_LIBRARY_PATH}" >> $GITHUB_ENV
             echo "Found cuDNN at: $CUDA_LIB"
-          else
-            echo "Warning: cuDNN not found, CUDA may not work"
           fi
 
-      - uses: actions/checkout@v3
+      - uses: actions/checkout@v4
         with:
           fetch-depth: 0
 
-      - name: Cache HuggingFace datasets
-        uses: actions/cache@v3
+      - name: Cache HuggingFace + PyG datasets
+        uses: actions/cache@v4
         with:
-          path: ~/.cache/huggingface/datasets
-          key: hf-datasets-proteins-v1
+          path: |
+            ~/.cache/huggingface/datasets
+            ~/.cache/huggingface/datasets/TUDataset
+          key: hf-datasets-proteins-v2
           restore-keys: |
             hf-datasets-proteins-
 
-      - name: Install dependencies
+      - name: Install dependencies (pinned)
         run: |
           python3 -m pip install --upgrade pip setuptools wheel
-          pip3 install torch-geometric datasets
-          pip3 install scikit-learn numpy matplotlib pandas
-          pip3 install pennylane pennylane-lightning
+          pip3 install \
+            "torch-geometric>=2.4.0" \
+            "datasets==2.18.0" \
+            "scikit-learn>=1.3.0" \
+            "numpy>=1.24.0" \
+            "matplotlib>=3.7.0" \
+            "pandas>=2.0.0" \
+            "tqdm>=4.66.0" \
+            "autoray<0.7" \
+            "pennylane==0.38.0" \
+            "pennylane-lightning==0.38.0"
 
       - name: Verify environment
         run: |
           python3 - << 'PYEOF'
-          import torch
-          import torch_geometric
-          import pennylane as qml
-          from datasets import load_dataset
+          import torch, torch_geometric, pennylane as qml
           print(f"PyTorch: {torch.__version__}")
           print(f"PyG: {torch_geometric.__version__}")
           print(f"PennyLane: {qml.__version__}")
           print(f"CUDA: {torch.cuda.is_available()}")
-          print("Imports OK")
+          try:
+              import datasets as hf_ds
+              print(f"HF datasets: {hf_ds.__version__}")
+          except Exception as e:
+              print(f"HF datasets unavailable: {e} (PyG fallback will be used)")
           PYEOF
 
       - name: Run PROTEINS experiment
         run: |
-          cd src && python3 train_proteins.py
+          cd src && python3 train_proteins.py --epochs "$EPOCHS"
+
+      - name: Upload training artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: proteins-metrics-${{ github.run_id }}
+          path: |
+            src/proteins_metrics.json
+            src/proteins_results.png
+          retention-days: 30
+          if-no-files-found: warn
+
+  report-proteins:
+    name: Report PROTEINS (A6000)
+    needs: train-proteins
+    runs-on: [self-hosted, A6000]
+    if: always() && needs.train-proteins.result == 'success'
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      WATERMARK_TITLE: "PROTEINS Experiment — QGCN"
+
+    steps:
+      - name: Add npm global bin to PATH
+        run: echo "$HOME/.npm-global/bin" >> $GITHUB_PATH
+
+      - uses: actions/checkout@v4
+
+      - name: Install report-only deps
+        run: |
+          pip3 install --upgrade pip
+          pip3 install "matplotlib>=3.7.0" "numpy>=1.24.0"
+
+      - name: Download PROTEINS training artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: proteins-metrics-${{ github.run_id }}
+          path: artifact-proteins
 
       - name: Generate CML report
         env:
           REPO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          cml ci
-
-          python3 - << 'PYEOF' > report.md
+          METRICS_JSON=$(find artifact-proteins -name "proteins_metrics.json" | head -1)
+          PLOT_PNG=$(find artifact-proteins -name "proteins_results.png" | head -1)
+          if [ -z "$METRICS_JSON" ]; then
+            echo "ERROR: proteins_metrics.json not found in artifact"
+            ls -R artifact-proteins
+            exit 1
+          fi
+          METRICS_PATH="$METRICS_JSON" python3 - << 'PYEOF' > report.md
           import json, os
-          metrics_path = 'proteins_metrics.json'
-          with open(metrics_path) as f:
+          with open(os.environ["METRICS_PATH"]) as f:
               m = json.load(f)
-
           hp = m.get('hyperparameters', {})
-          lines = []
-          lines.append('# PROTEINS Experiment Report — QGCN Graph Classification')
-          lines.append('')
-          lines.append(f"**Timestamp:** {m['timestamp']}")
-          lines.append(f"**Model:** {m['model']}")
-          lines.append(f"**Protocol:** {m['n_folds']}-fold stratified cross-validation")
-          lines.append('')
-
-          lines.append('## Dataset')
-          lines.append('')
-          lines.append('| Property | Value |')
-          lines.append('|----------|-------|')
-          lines.append(f"| Name | {m['dataset']} |")
-          lines.append(f"| Source | [{m['dataset_source']}](https://huggingface.co/datasets/{m['dataset_source']}) |")
-          lines.append(f"| Graphs | {m['n_graphs']} |")
-          lines.append(f"| Classes | {m['n_classes']} |")
-          lines.append(f"| Node feature dim | {m['node_feature_dim']} |")
-          lines.append(f"| Task | {m['task']} |")
-          lines.append(f"| Cache | `~/.cache/huggingface/datasets` (downloaded once, reused) |")
-          lines.append('')
-
-          lines.append('## Hyperparameters')
-          lines.append('')
-          lines.append('| Parameter | Value |')
-          lines.append('|-----------|-------|')
-          lines.append(f"| Epochs (max) | {hp.get('epochs', '—')} |")
-          lines.append(f"| Learning rate | {hp.get('learning_rate', '—')} |")
-          lines.append(f"| Batch size | {hp.get('batch_size', '—')} |")
-          lines.append(f"| Quantum circuit depths | {hp.get('q_depths', '—')} |")
-          lines.append(f"| Early stop patience | {hp.get('early_stop_patience', '—')} folds |")
-          lines.append(f"| Val frequency | every {hp.get('val_frequency', '—')} epochs |")
-          lines.append(f"| Optimizer | {hp.get('optimizer', '—')} |")
-          lines.append(f"| Loss | {hp.get('loss', '—')} |")
-          lines.append(f"| Activation | {hp.get('activation', '—')} |")
-          lines.append(f"| Random seed | {hp.get('random_seed', '—')} |")
-          lines.append('')
-
-          lines.append('## Summary')
-          lines.append('')
-          lines.append('| Metric | Mean | Std |')
-          lines.append('|--------|:----:|:---:|')
-          lines.append(f"| Accuracy | {m['mean_accuracy']:.4f} | {m['std_accuracy']:.4f} |")
-          lines.append(f"| F1 Score | {m['mean_f1']:.4f} | — |")
-          lines.append('')
-
-          lines.append('## Per-Fold Results')
-          lines.append('')
-          lines.append('| Fold | Accuracy | F1 | Precision | Recall |')
-          lines.append('|------|:--------:|:--:|:---------:|:------:|')
-          for i, fold in enumerate(m['per_fold']):
-              lines.append(f"| {i+1} | {fold['accuracy']:.4f} | {fold['f1']:.4f} | {fold['precision']:.4f} | {fold['recall']:.4f} |")
-          lines.append('')
-          print('\n'.join(lines))
+          out = []
+          out.append('# PROTEINS Experiment — QGCN Graph Classification')
+          out.append('')
+          out.append(f"**Timestamp:** {m.get('timestamp','—')}")
+          out.append(f"**Model:** {m.get('model','—')}")
+          out.append(f"**Protocol:** {m.get('n_folds','—')}-fold stratified CV")
+          out.append('')
+          out.append('## Dataset')
+          out.append('')
+          out.append('| Property | Value |')
+          out.append('|----------|-------|')
+          out.append(f"| Name | {m.get('dataset','PROTEINS')} |")
+          out.append(f"| Source | {m.get('dataset_source','—')} |")
+          out.append(f"| Graphs | {m.get('n_graphs','—')} |")
+          out.append(f"| Classes | {m.get('n_classes','—')} |")
+          out.append(f"| Node feature dim | {m.get('node_feature_dim','—')} |")
+          out.append(f"| Task | {m.get('task','—')} |")
+          out.append('')
+          out.append('## Hyperparameters')
+          out.append('')
+          out.append('| Parameter | Value |')
+          out.append('|-----------|-------|')
+          for k in ('epochs','learning_rate','batch_size','q_depths','early_stop_patience','val_frequency','optimizer','loss','activation','random_seed'):
+              out.append(f"| {k} | {hp.get(k,'—')} |")
+          out.append('')
+          out.append('## Summary')
+          out.append('')
+          out.append('| Metric | Mean | Std |')
+          out.append('|--------|:----:|:---:|')
+          out.append(f"| Accuracy | {m.get('mean_accuracy',0):.4f} | {m.get('std_accuracy',0):.4f} |")
+          out.append(f"| F1 Score | {m.get('mean_f1',0):.4f} | — |")
+          out.append('')
+          out.append('## Per-Fold Results')
+          out.append('')
+          out.append('| Fold | Accuracy | F1 | Precision | Recall |')
+          out.append('|------|:--------:|:--:|:---------:|:------:|')
+          for i, fold in enumerate(m.get('per_fold', []) or []):
+              out.append(f"| {i+1} | {fold.get('accuracy',0):.4f} | {fold.get('f1',0):.4f} | {fold.get('precision',0):.4f} | {fold.get('recall',0):.4f} |")
+          print('\n'.join(out))
           PYEOF
 
-          if [ -f proteins_results.png ]; then
+          if [ -n "$PLOT_PNG" ] && [ -f "$PLOT_PNG" ]; then
+            cp "$PLOT_PNG" proteins_results.png
+            echo "" >> report.md
             echo "## Results Visualization" >> report.md
             echo "" >> report.md
-            cml publish proteins_results.png --md >> report.md
+            echo "![proteins results](./proteins_results.png)" >> report.md
           fi
 
-          cml comment create report.md
+          cml ci
+          cml comment update --watermark-title="$WATERMARK_TITLE" report.md || \
+            echo "WARN: cml post failed"
 
-      - name: Save artifacts
+      - name: Re-upload final report
+        uses: actions/upload-artifact@v4
         if: always()
-        run: |
-          ARTIFACT_DIR="/tmp/proteins-${GITHUB_RUN_ID}"
-          mkdir -p "$ARTIFACT_DIR"
-          cp proteins_metrics.json "$ARTIFACT_DIR/" 2>/dev/null || true
-          cp proteins_results.png "$ARTIFACT_DIR/" 2>/dev/null || true
-          ls -lah "$ARTIFACT_DIR"
-          echo "Artifacts: $ARTIFACT_DIR"
-
-      - name: Commit metrics
-        if: github.event_name == 'push' && github.ref == 'refs/heads/main'
-        run: |
-          cp proteins_metrics.json proteins_baseline.json
-          git config user.email "ci@example.com"
-          git config user.name "CI Bot"
-          git add proteins_baseline.json
-          git commit -m "metrics: update PROTEINS baseline" || true
-          git push origin HEAD:main || true
+        with:
+          name: proteins-report-${{ github.run_id }}
+          path: |
+            report.md
+            proteins_results.png
+          retention-days: 30
+          if-no-files-found: warn

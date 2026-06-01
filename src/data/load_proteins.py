@@ -1,7 +1,13 @@
 """
-PROTEINS dataset loader from HuggingFace.
-Converts to PyTorch Geometric Data objects.
-Caches to ~/.cache/huggingface/datasets/ (default HF behavior).
+PROTEINS dataset loader.
+
+Primary path: HuggingFace ``graphs-datasets/PROTEINS``.
+Fallback path: PyG ``torch_geometric.datasets.TUDataset(name="PROTEINS")``.
+
+The fallback exists because the HuggingFace ``datasets`` library has shipped
+cache-incompatible schema changes that crash ``Features.from_dict`` with
+``TypeError: must be called with a dataclass type or instance`` when an
+older cache is read by a newer client.
 
 Dataset: graphs-datasets/PROTEINS
   - 1,113 protein graphs
@@ -9,22 +15,57 @@ Dataset: graphs-datasets/PROTEINS
   - Node features: 3-dim (degree + 2 biochemical attributes)
 """
 
+from __future__ import annotations
+
 import os
+import warnings
+from typing import List
+
 import torch
 from torch_geometric.data import Data
-from datasets import load_dataset
 
 
-_HF_CACHE = os.environ.get("HF_DATASETS_CACHE", os.path.expanduser("~/.cache/huggingface/datasets"))
+_HF_CACHE = os.environ.get(
+    "HF_DATASETS_CACHE", os.path.expanduser("~/.cache/huggingface/datasets")
+)
 
 
-def load_proteins(cache_dir: str = _HF_CACHE):
-    """
-    Load PROTEINS from HuggingFace (cached after first download).
-    Returns: list of torch_geometric.data.Data (1,113 graphs)
-    """
-    raw = load_dataset("graphs-datasets/PROTEINS", cache_dir=cache_dir)
-    return _convert(raw)
+def load_proteins(cache_dir: str = _HF_CACHE) -> List[Data]:
+    """Load PROTEINS. HF first, PyG TUDataset fallback."""
+    try:
+        from datasets import load_dataset
+
+        raw = load_dataset("graphs-datasets/PROTEINS", cache_dir=cache_dir)
+        return _convert(raw)
+    except Exception as exc:  # noqa: BLE001
+        warnings.warn(
+            f"HuggingFace PROTEINS loader failed ({type(exc).__name__}: {exc}); "
+            "falling back to torch_geometric.datasets.TUDataset.",
+            stacklevel=2,
+        )
+        return _load_tudataset_proteins(cache_dir)
+
+
+def _load_tudataset_proteins(cache_dir: str) -> List[Data]:
+    """Native PyG loader. PROTEINS: 1,113 graphs, 3-dim node features."""
+    from torch_geometric.datasets import TUDataset
+
+    root = os.path.join(cache_dir, "TUDataset")
+    os.makedirs(root, exist_ok=True)
+    ds = TUDataset(root=root, name="PROTEINS")
+    graphs: List[Data] = []
+    for g in ds:
+        y = g.y.view(-1).long() if g.y is not None else torch.tensor([0], dtype=torch.long)
+        graphs.append(
+            Data(
+                x=g.x.float() if g.x is not None else None,
+                edge_index=g.edge_index,
+                edge_attr=g.edge_attr.float() if g.edge_attr is not None else None,
+                y=y[:1],
+                num_nodes=g.num_nodes,
+            )
+        )
+    return graphs
 
 
 def _convert(raw) -> list:
