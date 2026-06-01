@@ -216,14 +216,14 @@ jobs:
           print(f"HF datasets:    {datasets.__version__}")
           PYEOF
 
-      - name: Run training — MUTAG & PROTEINS
+      - name: Run training — IMDB-MULTI, IMDB-BINARY & MUTAG & PROTEINS
         run: |
           echo "Q-Drop algorithm : $ALGORITHM"
           echo "Max epochs       : $EPOCHS"
           if [ -n "$N_QUBITS" ]; then
             echo "Quantum width    : $N_QUBITS"
             python src/train_quantum_models.py \
-              --datasets mutag proteins \
+              --datasets imdb_multi imdb_binary nci1 mutag proteins \
               --epochs "$EPOCHS" \
               --algorithm "$ALGORITHM" \
               --n-qubits "$N_QUBITS" \
@@ -233,7 +233,7 @@ jobs:
               --seed 42
           else
             python src/train_quantum_models.py \
-              --datasets mutag proteins \
+              --datasets imdb_multi imdb_binary nci1 mutag proteins \
               --epochs "$EPOCHS" \
               --algorithm "$ALGORITHM" \
               --output-dir "$OUTPUT_DIR" \
