@@ -19,7 +19,7 @@ name: Quantum Graph Training — MUTAG & PROTEINS
 
 on:
   push:
-    branches: [feat/torch_qdrop]
+    branches: [feat/torch_qdrop, main]
     paths:
       - "src/models/**"
       - "src/qdrop/**"

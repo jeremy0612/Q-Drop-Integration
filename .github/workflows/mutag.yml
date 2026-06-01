@@ -9,7 +9,7 @@ name: MUTAG Experiment - QGCN Graph Classification
 
 on:
   push:
-    branches: [main]
+    branches: [dev]
     paths:
       - 'src/train_mutag.py'
       - 'src/data/load_mutag.py'

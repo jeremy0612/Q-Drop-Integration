@@ -5,7 +5,7 @@ name: PROTEINS Experiment - QGCN Graph Classification
 
 on:
   push:
-    branches: [main]
+    branches: [dev]
     paths:
       - 'src/train_proteins.py'
       - 'src/data/load_proteins.py'
