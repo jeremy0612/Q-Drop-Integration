@@ -175,9 +175,9 @@ jobs:
       artifact-suffix: dropout
 
   report-dropout:
-    name: Report (dropout, A6000)
+    name: Report (dropout, P6000)
     needs: train-dropout
-    runs-on: [self-hosted, A6000]
+    runs-on: [self-hosted, P6000]
     if: always() && needs.train-dropout.result == 'success'
     permissions:
       # On `push` events CML targets commit comments
@@ -281,9 +281,9 @@ jobs:
       artifact-suffix: both
 
   report-both:
-    name: Report (both, A6000)
+    name: Report (both, P6000)
     needs: train-both
-    runs-on: [self-hosted, A6000]
+    runs-on: [self-hosted, P6000]
     if: always() && needs.train-both.result == 'success'
     permissions:
       # On `push` events CML targets commit comments
