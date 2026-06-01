@@ -69,10 +69,18 @@ def build_per_block_optimizers(
     lr: float,
     weight_decay: float = 0.0,
 ) -> List[optim.Optimizer]:
-    """One AdamW per block. Block independence requires independent optimizer state."""
+    """One AdamW per block. Block independence requires independent optimizer state.
+
+    Class embedding is appended to EVERY block's parameter group so it
+    receives a gradient step on every backward, regardless of which block
+    runs. Without this the embeddings stay at random orthogonal init and
+    the model has to denoise toward fixed random targets — which empirically
+    parks accuracy near chance for binary tasks.
+    """
     opts: List[optim.Optimizer] = []
+    class_emb_params = list(model.class_embedding.parameters())
     for b in range(model.n_blocks):
-        params = model.block_parameters(b)
+        params = model.block_parameters(b) + class_emb_params
         if not params:
             opts.append(None)  # type: ignore
             continue

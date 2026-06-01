@@ -166,9 +166,39 @@ def train_dataset(
         )
         final = evaluate(model, test_loader, device)
         print(f"  fold {fold_idx + 1}: accuracy={final['accuracy']:.4f}", flush=True)
+
+        # Build report-script-compatible curves. The existing
+        # scripts/generate_cml_report.py expects train_curve / val_curve
+        # as lists of {epoch, loss, accuracy, f1, ...} dicts. QDB stores
+        # block_loss[b][epoch] and val_accuracy[epoch]. Synthesize the
+        # required schema by averaging block losses per epoch.
+        n_epochs = len(history["block_loss"][0]) if history["block_loss"] else 0
+        train_curve = []
+        for ep in range(n_epochs):
+            losses_at_ep = [
+                history["block_loss"][b][ep]
+                for b in range(model.n_blocks)
+                if not np.isnan(history["block_loss"][b][ep])
+            ]
+            avg_loss = float(np.mean(losses_at_ep)) if losses_at_ep else 0.0
+            train_curve.append({"epoch": ep + 1, "loss": avg_loss, "accuracy": 0.0, "f1": 0.0})
+        val_curve = [
+            {"epoch": ep + 1, "loss": 0.0, "accuracy": acc, "f1": 0.0}
+            for ep, acc in enumerate(history["val_accuracy"])
+        ]
+
         fold_result = {
             "fold": fold_idx + 1,
             "accuracy": final["accuracy"],
+            "precision": 0.0,
+            "recall": 0.0,
+            "f1": 0.0,
+            "roc_auc": 0.0,
+            "pr_auc": 0.0,
+            "test_loss": 0.0,
+            "train_curve": train_curve,
+            "val_curve": val_curve,
+            "qdrop_curve": [],
             "block_loss": history["block_loss"],
             "val_accuracy_curve": history["val_accuracy"],
         }
@@ -178,31 +208,73 @@ def train_dataset(
         # without waiting for all 10 folds.
         with open(dataset_dir / f"fold_{fold_idx + 1}.json", "w") as fh:
             json.dump(fold_result, fh, indent=2)
-        running_summary = {
-            "timestamp": datetime.now().isoformat(),
-            "dataset": spec.name,
-            "completed_folds": len(fold_results),
-            "fold_results": fold_results,
-            "mean_accuracy_so_far": float(np.mean([r["accuracy"] for r in fold_results])),
-        }
+        running_summary = _build_dataset_summary(
+            spec, config, model_type, n_qubits, in_channels, fold_results, len(graphs), partial=True
+        )
         with open(dataset_dir / "metrics.json", "w") as fh:
             json.dump(running_summary, fh, indent=2)
 
-    summary = {
-        "timestamp": datetime.now().isoformat(),
-        "dataset": spec.name,
-        "model": model_type,
-        "n_blocks": config.n_blocks,
-        "n_qubits": n_qubits,
-        "algorithm": config.algorithm,
-        "config": vars(config),
-        "fold_results": fold_results,
-        "mean_accuracy": float(np.mean([r["accuracy"] for r in fold_results])),
-        "std_accuracy": float(np.std([r["accuracy"] for r in fold_results])),
-    }
+    summary = _build_dataset_summary(
+        spec, config, model_type, n_qubits, in_channels, fold_results, len(graphs), partial=False
+    )
     with open(dataset_dir / "metrics.json", "w") as f:
         json.dump(summary, f, indent=2)
     return summary
+
+
+def _build_dataset_summary(
+    spec,
+    config,
+    model_type: str,
+    n_qubits: int,
+    in_channels: int,
+    fold_results: List[Dict],
+    n_graphs: int,
+    partial: bool,
+) -> Dict:
+    """Shape per-dataset summary to match the existing report script.
+
+    scripts/generate_cml_report.py expects:
+      - top-level keys: dataset (label), config, summary{mean_*, std_*}, folds
+      - per fold: train_curve, val_curve, qdrop_curve, accuracy, fold
+
+    We also keep QDB-native keys (block_loss, n_blocks, fold_results alias)
+    for downstream consumers.
+    """
+    accs = [r["accuracy"] for r in fold_results] or [0.0]
+    summary_block = {
+        f"mean_{m}": float(np.mean([r.get(m, 0.0) for r in fold_results])) if fold_results else 0.0
+        for m in ("accuracy", "precision", "recall", "f1", "roc_auc", "pr_auc")
+    }
+    summary_block.update(
+        {
+            f"std_{m}": float(np.std([r.get(m, 0.0) for r in fold_results])) if fold_results else 0.0
+            for m in ("accuracy", "precision", "recall", "f1", "roc_auc", "pr_auc")
+        }
+    )
+
+    config_dict = vars(config) if not isinstance(config, dict) else dict(config)
+    config_dict.setdefault("n_qubits", n_qubits)
+    config_dict.setdefault("model", model_type)
+
+    return {
+        "timestamp": datetime.now().isoformat(),
+        "dataset": spec.name,
+        "dataset_source": spec.source,
+        "task": spec.task,
+        "n_classes": spec.n_classes,
+        "n_graphs": n_graphs,
+        "node_feature_dim": in_channels,
+        "model": f"QDB-{model_type.upper()}",
+        "config": config_dict,
+        "summary": summary_block,
+        "folds": fold_results,
+        "fold_results": fold_results,  # alias for QDB-native callers
+        "completed_folds": len(fold_results),
+        "partial": partial,
+        "mean_accuracy": float(np.mean(accs)),
+        "std_accuracy": float(np.std(accs)),
+    }
 
 
 def build_parser() -> argparse.ArgumentParser:
