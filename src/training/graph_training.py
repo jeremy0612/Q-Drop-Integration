@@ -738,23 +738,65 @@ def train_dataset(
     splitter = StratifiedKFold(n_splits=config.n_folds, shuffle=True, random_state=config.seed)
     fold_results: List[Dict] = []
 
+    # Pre-create the dataset output dir so per-fold checkpoints have a
+    # destination on disk before fold 1 even finishes. If the runner is
+    # canceled mid-training, all completed folds remain visible in the
+    # uploaded artifact (upload-artifact runs with `if: always()`).
+    dataset_dir: Optional[Path] = None
+    if base_output is not None:
+        dataset_dir = base_output / dataset_key
+        dataset_dir.mkdir(parents=True, exist_ok=True)
+
     n_classes = dataset_spec.n_classes
-    for fold_idx, (train_idx, test_idx) in enumerate(splitter.split(graphs, labels)):
+    fold_iter = tqdm(
+        enumerate(splitter.split(graphs, labels)),
+        total=config.n_folds,
+        desc=f"{dataset_spec.name} folds",
+        leave=True,
+    )
+    for fold_idx, (train_idx, test_idx) in fold_iter:
         train_graphs = [graphs[index] for index in train_idx]
         test_graphs = [graphs[index] for index in test_idx]
-        fold_results.append(
-            train_fold(
-                train_graphs=train_graphs,
-                test_graphs=test_graphs,
-                config=config,
-                device=device,
-                dataset_name=dataset_spec.name,
-                fold_idx=fold_idx,
-                n_classes=n_classes,
-            )
+        fold_result = train_fold(
+            train_graphs=train_graphs,
+            test_graphs=test_graphs,
+            config=config,
+            device=device,
+            dataset_name=dataset_spec.name,
+            fold_idx=fold_idx,
+            n_classes=n_classes,
         )
+        fold_results.append(fold_result)
+
+        # Per-fold checkpoint: rewrite metrics.json after EVERY fold so a
+        # mid-run cancel preserves partial results. Also snapshot the
+        # single fold as fold_<n>.json for granular post-mortem.
+        if dataset_dir is not None:
+            try:
+                partial_payload = serialize_result_payload(
+                    dataset_key, graphs, config, fold_results
+                )
+                partial_payload["partial"] = fold_idx + 1 < config.n_folds
+                partial_payload["completed_folds"] = len(fold_results)
+                with open(dataset_dir / "metrics.json", "w", encoding="utf-8") as fh:
+                    json.dump(partial_payload, fh, indent=2)
+                with open(
+                    dataset_dir / f"fold_{fold_idx + 1}.json", "w", encoding="utf-8"
+                ) as fh:
+                    json.dump(fold_result, fh, indent=2)
+            except Exception as exc:  # noqa: BLE001 — never break training on persistence failure
+                print(f"WARN: per-fold checkpoint write failed: {exc}", flush=True)
+
+        try:
+            fold_iter.set_postfix_str(
+                f"acc={fold_result.get('accuracy', 0.0):.3f}"
+            )
+        except AttributeError:
+            pass
 
     result_payload = serialize_result_payload(dataset_key, graphs, config, fold_results)
+    result_payload["partial"] = False
+    result_payload["completed_folds"] = len(fold_results)
     metrics = result_payload["summary"]
     print(
         f"{dataset_spec.name} results: "
@@ -762,9 +804,7 @@ def train_dataset(
         f"f1={metrics['mean_f1']:.4f}±{metrics['std_f1']:.4f}"
     )
 
-    if base_output is not None:
-        dataset_dir = base_output / dataset_key
-        dataset_dir.mkdir(parents=True, exist_ok=True)
+    if dataset_dir is not None:
         out_path = dataset_dir / "metrics.json"
         with open(out_path, "w", encoding="utf-8") as output_file:
             json.dump(result_payload, output_file, indent=2)
@@ -914,6 +954,7 @@ def run_experiments(config: GraphTrainConfig) -> Tuple[Path, Dict[str, Dict]]:
     print(f"Algorithm: {config.algorithm}")
     print(f"Output: {base_output.resolve()}")
 
+    summary_path = base_output / "summary.json"
     all_results: Dict[str, Dict] = {}
     for dataset_name in config.datasets:
         dataset_key = normalize_dataset_name(dataset_name)
@@ -923,8 +964,14 @@ def run_experiments(config: GraphTrainConfig) -> Tuple[Path, Dict[str, Dict]]:
             device=device,
             base_output=base_output,
         )
+        # Rewrite the global summary after every dataset so a mid-run
+        # cancel preserves the completed datasets in the uploaded artifact.
+        try:
+            with open(summary_path, "w", encoding="utf-8") as summary_file:
+                json.dump(all_results, summary_file, indent=2)
+        except Exception as exc:  # noqa: BLE001
+            print(f"WARN: per-dataset summary write failed: {exc}", flush=True)
 
-    summary_path = base_output / "summary.json"
     with open(summary_path, "w", encoding="utf-8") as summary_file:
         json.dump(all_results, summary_file, indent=2)
     print(f"\nSaved global summary to: {summary_path}")
