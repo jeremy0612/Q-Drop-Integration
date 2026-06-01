@@ -28,6 +28,7 @@ class QGCN(Module):
         mlp_dropout=0.5,
         use_residual=False,
         use_strongly_entangling=False,
+        weight_init=None,
     ):
         super().__init__()
         max_qubits = 16
@@ -51,6 +52,7 @@ class QGCN(Module):
                 layer_input_dims, q_depth,
                 n_qubits=n_qubits,
                 use_strongly_entangling=use_strongly_entangling,
+                weight_init=weight_init,
             ))
 
         self.layers = ModuleList(layers)

@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import os
+from typing import Callable, Optional
 
 import pennylane as qml
 import torch
@@ -51,7 +52,13 @@ def _select_device_and_diff(n_qubits: int):
 class QuantumCircuitAdapter(nn.Module):
     """Own a PennyLane TorchLayer and expose lazy Q-Drop specs for it."""
 
-    def __init__(self, n_qubits: int, n_layers: int, use_strongly_entangling: bool = False):
+    def __init__(
+        self,
+        n_qubits: int,
+        n_layers: int,
+        use_strongly_entangling: bool = False,
+        weight_init: Optional[Callable[[torch.Tensor], torch.Tensor]] = None,
+    ):
         super().__init__()
         self.n_qubits = n_qubits
         self.n_layers = n_layers
@@ -77,7 +84,15 @@ class QuantumCircuitAdapter(nn.Module):
 
             weight_shapes = {"weights": (n_layers, n_qubits)}
 
-        self.quantum_layer = qml.qnn.TorchLayer(qnode, weight_shapes)
+        # Exposed for QNG metric-tensor access (qml.metric_tensor needs the
+        # bare qnode, not the TorchLayer wrapper).
+        self.bare_qnode = qnode
+
+        torch_layer_kwargs = {}
+        if weight_init is not None:
+            torch_layer_kwargs["init_method"] = {"weights": weight_init}
+
+        self.quantum_layer = qml.qnn.TorchLayer(qnode, weight_shapes, **torch_layer_kwargs)
         self.register_buffer("forward_output_mask", torch.ones(n_qubits, dtype=torch.float32))
 
     @property
