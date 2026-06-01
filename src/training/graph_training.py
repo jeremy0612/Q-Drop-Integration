@@ -166,6 +166,7 @@ class GraphTrainConfig:
     use_strongly_entangling: bool = False
     model_type: str = "qgcn"
     attn_dropout: float = 0.2
+    technique: str = "baseline"  # baseline | small_angle | qng | layerwise
 
 
 class EarlyStopping:
@@ -269,6 +270,11 @@ def compute_metrics(
 def build_model(input_dims: int, config: GraphTrainConfig, n_classes: int = 2) -> nn.Module:
     output_dims = 1 if n_classes == 2 else n_classes
 
+    # Resolve QML technique hooks (weight_init for the quantum TorchLayer).
+    from qml_techniques.registry import get_technique
+
+    technique_spec = get_technique(getattr(config, "technique", "baseline"))
+
     if config.model_type == "qgat":
         return QGAT(
             input_dims=input_dims,
@@ -297,6 +303,7 @@ def build_model(input_dims: int, config: GraphTrainConfig, n_classes: int = 2) -
         mlp_dropout=config.mlp_dropout,
         use_residual=config.use_residual,
         use_strongly_entangling=config.use_strongly_entangling,
+        weight_init=technique_spec.weight_init,
     )
 
 
@@ -328,8 +335,46 @@ def split_quantum_classical_params(
 
 def build_optimizer(model: nn.Module, config: GraphTrainConfig) -> optim.Optimizer:
     quantum_params, classical_params = split_quantum_classical_params(model)
-    quantum_lr = config.lr * float(config.quantum_lr_scale)
 
+    # QNG branch: precondition quantum gradients by the Fubini-Study metric
+    # tensor evaluated at current angles + a zero-input sample. Only fires
+    # for QGCN (QGAT uses a different quantum_layer attribute layout).
+    if getattr(config, "technique", "baseline") == "qng" and quantum_params:
+        try:
+            import pennylane as qml  # noqa: F401  # needed for metric_tensor
+            from qml_techniques.qng import QNGAdam
+
+            def _metric_provider(p: nn.Parameter) -> torch.Tensor:
+                for layer in getattr(model, "layers", []):
+                    quantum_layer = getattr(layer, "quantum_layer", None)
+                    if quantum_layer is None:
+                        continue
+                    if getattr(quantum_layer, "weights", None) is p:
+                        bare_qnode = getattr(quantum_layer, "bare_qnode", None)
+                        if bare_qnode is None:
+                            break
+                        sample_input = torch.zeros(quantum_layer.n_qubits, device=p.device)
+                        try:
+                            metric_fn = qml.metric_tensor(bare_qnode, approx="block-diag")
+                            f = metric_fn(sample_input, p.detach())
+                            if not isinstance(f, torch.Tensor):
+                                f = torch.as_tensor(f, device=p.device, dtype=p.dtype)
+                            return f.detach().to(device=p.device, dtype=p.dtype).reshape(p.numel(), p.numel())
+                        except Exception:  # noqa: BLE001 — fall back to identity on failure
+                            return torch.eye(p.numel(), device=p.device, dtype=p.dtype)
+                return torch.eye(p.numel(), device=p.device, dtype=p.dtype)
+
+            return QNGAdam(
+                quantum_params=quantum_params,
+                classical_params=classical_params,
+                metric_provider=_metric_provider,
+                lr=config.lr,
+                weight_decay=config.weight_decay,
+            )
+        except ImportError:
+            pass  # qml_techniques unavailable; fall through to standard optimizer
+
+    quantum_lr = config.lr * float(config.quantum_lr_scale)
     if quantum_params:
         param_groups: List[Dict] = [
             {"params": classical_params, "lr": config.lr, "name": "classical"},
@@ -532,6 +577,21 @@ def train_fold(
             f"quantum scalars: {qdrop_manager.quantum_scalar_count}"
         )
 
+    # Layerwise learning schedule: freeze per-conv quantum weights and
+    # progressively unfreeze across training phases. No-op for other techniques.
+    layerwise_schedule = None
+    if getattr(config, "technique", "baseline") == "layerwise":
+        try:
+            from qml_techniques.layerwise import LayerwiseSchedule
+
+            n_phases = max(1, len(config.q_depths))
+            layerwise_schedule = LayerwiseSchedule(
+                model=model, total_epochs=config.epochs, n_phases=n_phases
+            )
+            print(f"  Layerwise: {n_phases} phases over {config.epochs} epochs")
+        except ImportError:
+            layerwise_schedule = None
+
     stopper = EarlyStopping(config.early_stop_patience)
     train_curve = []
     val_curve = []
@@ -540,6 +600,8 @@ def train_fold(
     print(f"  Fold {fold_idx + 1}: training...")
     progress = tqdm(range(1, config.epochs + 1), leave=False, desc=f"{dataset_name}-F{fold_idx + 1}")
     for epoch in progress:
+        if layerwise_schedule is not None:
+            layerwise_schedule.apply_for_epoch(epoch - 1)
         train_loss, train_metrics = run_epoch(
             model=model,
             loader=train_loader,
@@ -875,6 +937,13 @@ def build_train_parser(
     parser.add_argument("--use-strongly-entangling", action="store_true", default=False)
     parser.add_argument("--model-type", type=str, default="qgcn", choices=["qgcn", "qgat"])
     parser.add_argument("--attn-dropout", type=float, default=0.2)
+    parser.add_argument(
+        "--technique",
+        type=str,
+        default="baseline",
+        choices=["baseline", "small_angle", "qng", "layerwise"],
+        help="QML quantum-weight optimization technique",
+    )
     return parser
 
 
@@ -912,6 +981,7 @@ def config_from_args(args: argparse.Namespace) -> GraphTrainConfig:
         use_strongly_entangling=args.use_strongly_entangling,
         model_type=args.model_type,
         attn_dropout=args.attn_dropout,
+        technique=args.technique,
     )
 
 
