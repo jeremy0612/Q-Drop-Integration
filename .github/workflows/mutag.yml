@@ -32,6 +32,7 @@ jobs:
   train-mutag:
     name: Train MUTAG (A6000)
     runs-on: [self-hosted, A6000]
+    timeout-minutes: 240
     permissions:
       contents: write
       pull-requests: write

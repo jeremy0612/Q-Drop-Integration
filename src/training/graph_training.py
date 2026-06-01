@@ -87,40 +87,27 @@ DATASET_SPECS: Dict[str, GraphDatasetSpec] = {
 }
 
 
-# Per-dataset quantum-tensor-width overrides. PROTEINS has only 4 node
-# features but ~39 nodes per graph and a wider class boundary than MUTAG,
-# so the default 8-wire bucket leaves the circuit under-expressive while
-# MUTAG (7 features) saturates 8 wires. Forcing PROTEINS to 16 doubles
-# the rotation-angle capacity at the cost of ~2x quantum runtime per
-# QGCNConv call.
+# Per-dataset quantum-tensor-width overrides. All clamped to 8 qubits:
+# 2^16 state vector on lightning.qubit (CPU C++) still costs ~650 M
+# complex ops per forward at n_qubits=16, and 10-fold CV × 100 epochs ×
+# ~126 steps/fold on PROTEINS (~80 trillion ops total) exceeds the
+# 6-hour self-hosted runner timeout. Capacity-experiments at n=16 are
+# kept for ad-hoc runs via the --n-qubits CLI flag; routine CI uses 8.
+# PROTEINS (3 features), IMDB (136/89 degree one-hot), NCI1 (37 features)
+# all train usefully at 8 qubits.
 DATASET_NQUBITS_OVERRIDES: Dict[str, int] = {
-    "proteins": 16,
-    # NCI1 has 37-dim features; without override the bucketing sends it to
-    # 16 qubits (min(37,16)=16, >8 → bucket to 16). Force 8 so the
-    # simulator state per node is 2^8 instead of 2^16, keeping memory sane
-    # for the 4,110-graph dataset.
-    "nci1": 8,
-    # IMDB datasets use degree one-hot features (136 / 89 dims) which
-    # naturally bucket to 16 qubits. Keep 16 for expressiveness.
-    "imdb_binary": 16,
-    "imdb_multi": 16,
-}
-
-
-# Per-dataset batch-size overrides bound to n_qubits overrides. At
-# n_qubits=16 PennyLane default.qubit stores a 2^16-amplitude state per
-# node and (with backprop) every intermediate state in the circuit, so
-# memory scales linearly with (nodes_per_batch * 2^n_qubits * circuit
-# depth). PROTEINS averages ~39 nodes per graph, so batch_size=32 turns
-# into ~1248 nodes per batch and ~80 GB of stored state on a 16-wire
-# circuit, exceeding even an A6000. Dropping to 8 graphs trims memory ~4x
-# while keeping the gradient signal informative.
-DATASET_BATCHSIZE_OVERRIDES: Dict[str, int] = {
     "proteins": 8,
-    # 16-qubit circuits need the same memory reduction as PROTEINS.
+    "nci1": 8,
     "imdb_binary": 8,
     "imdb_multi": 8,
 }
+
+
+# Per-dataset batch-size overrides. With n_qubits clamped to 8 the
+# simulator state is 2^8 = 256 amplitudes (vs 65 536 at n=16), and the
+# previous batch=8 emergency cap is no longer needed. Letting batch
+# return to the default 32 restores SGD signal quality and 4x throughput.
+DATASET_BATCHSIZE_OVERRIDES: Dict[str, int] = {}
 
 # Per-dataset model-architecture overrides that activate alongside the
 # n_qubits override (same applied_nqubits_override gate). Only fires when

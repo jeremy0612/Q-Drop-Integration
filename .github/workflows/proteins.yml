@@ -28,6 +28,7 @@ jobs:
   train-proteins:
     name: Train PROTEINS (A6000)
     runs-on: [self-hosted, A6000]
+    timeout-minutes: 540
     permissions:
       contents: write
       pull-requests: write
