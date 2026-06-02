@@ -35,6 +35,10 @@ on:
         description: "Suffix appended to upload-artifact name"
         type: string
         required: true
+      branch:
+        description: "Git ref to check out (where qml_techniques code lives)"
+        type: string
+        default: "feat/qml_techniques"
 
 jobs:
   train:
@@ -63,6 +67,7 @@ jobs:
 
       - uses: actions/checkout@v4
         with:
+          ref: ${{ inputs.branch }}
           fetch-depth: 0
 
       - name: System info
