@@ -1,0 +1,116 @@
+name: QML Benchmark — Techniques x Q-Drop Algorithms
+
+# Orchestrator: 4 techniques x 4 Q-Drop algorithms = 16 parallel cells
+# per dispatched dataset. Final aggregator collects all artifacts and
+# posts a CML comparison table.
+
+on:
+  push:
+    branches: [feat/qml_techniques]
+    paths:
+      - "src/qml_techniques/**"
+      - "src/models/**"
+      - "src/training/graph_training.py"
+      - "src/train_quantum_models.py"
+      - ".github/workflows/qml_benchmark.yml"
+      - ".github/workflows/_train_qml_one.yml"
+      - "scripts/qml_benchmark_aggregator.py"
+  workflow_dispatch:
+    inputs:
+      dataset:
+        description: "Dataset key (mutag | proteins | nci1 | imdb_binary | imdb_multi)"
+        required: false
+        default: "mutag"
+      epochs:
+        description: "Max training epochs per fold"
+        required: false
+        default: "50"
+      folds:
+        description: "Cross-validation folds"
+        required: false
+        default: "4"
+      n_qubits:
+        description: "Quantum tensor width"
+        required: false
+        default: "8"
+
+permissions:
+  contents: write
+  pull-requests: write
+
+jobs:
+  benchmark-cell:
+    name: ${{ matrix.technique }} x ${{ matrix.algorithm }}
+    strategy:
+      fail-fast: false
+      matrix:
+        technique: [baseline, small_angle, qng, layerwise]
+        algorithm: [baseline, pruning, dropout, both]
+    uses: ./.github/workflows/_train_qml_one.yml
+    secrets: inherit
+    with:
+      technique: ${{ matrix.technique }}
+      algorithm: ${{ matrix.algorithm }}
+      dataset: ${{ github.event.inputs.dataset || 'mutag' }}
+      epochs: ${{ github.event.inputs.epochs || '50' }}
+      folds: ${{ github.event.inputs.folds || '4' }}
+      n_qubits: ${{ github.event.inputs.n_qubits || '8' }}
+      runner-labels: '["self-hosted","A6000"]'
+      artifact-suffix: ${{ matrix.technique }}-${{ matrix.algorithm }}
+
+  aggregate-report:
+    name: Aggregate benchmark + post CML table
+    needs: benchmark-cell
+    runs-on: [self-hosted, A6000]
+    if: always()
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      WATERMARK_TITLE: "QML Benchmark — ${{ github.event.inputs.dataset || 'mutag' }}"
+    steps:
+      - name: Add npm global bin to PATH
+        run: echo "$HOME/.npm-global/bin" >> $GITHUB_PATH
+
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install report deps
+        run: |
+          pip3 install --upgrade pip
+          pip3 install "matplotlib>=3.7.0" "numpy>=1.24.0" "pandas>=2.0.0"
+
+      - name: Download all cell artifacts
+        uses: actions/download-artifact@v4
+        with:
+          pattern: qml-benchmark-*-${{ github.run_id }}
+          path: artifacts/
+          merge-multiple: false
+
+      - name: Build benchmark table
+        run: |
+          python3 scripts/qml_benchmark_aggregator.py \
+            --artifacts artifacts \
+            --output benchmark_report.md \
+            --dataset "${{ github.event.inputs.dataset || 'mutag' }}"
+
+      - name: Post CML comment
+        env:
+          REPO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cml ci
+          cml comment update --watermark-title="$WATERMARK_TITLE" benchmark_report.md || \
+            echo "WARN: cml post failed"
+
+      - name: Upload aggregated report
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: qml-benchmark-report-${{ github.run_id }}
+          path: |
+            benchmark_report.md
+          retention-days: 30
