@@ -33,6 +33,10 @@ on:
         description: "Quantum tensor width"
         required: false
         default: "8"
+      branch:
+        description: "Code branch to check out (must contain qml_techniques modules + --technique CLI)"
+        required: false
+        default: "feat/qml_techniques"
 
 permissions:
   contents: write
@@ -57,6 +61,7 @@ jobs:
       n_qubits: ${{ github.event.inputs.n_qubits || '8' }}
       runner-labels: '["self-hosted","A6000"]'
       artifact-suffix: ${{ matrix.technique }}-${{ matrix.algorithm }}
+      branch: ${{ github.event.inputs.branch || 'feat/qml_techniques' }}
 
   aggregate-report:
     name: Aggregate benchmark + post CML table
@@ -73,6 +78,8 @@ jobs:
         run: echo "$HOME/.npm-global/bin" >> $GITHUB_PATH
 
       - uses: actions/checkout@v4
+        with:
+          ref: ${{ github.event.inputs.branch || 'feat/qml_techniques' }}
 
       - name: Set up Python 3.10
         uses: actions/setup-python@v5
