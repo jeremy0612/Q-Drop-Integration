@@ -169,15 +169,15 @@ jobs:
       epochs: ${{ github.event.inputs.epochs || '100' }}
       n_qubits: ${{ github.event.inputs.n_qubits || '' }}
       # P6000 cannot reach CML's asset upload backend — skip the post here
-      # and let `report-dropout` handle it from the A6000 instead.
+      # and let `report-dropout` handle it from the P6000 instead.
       post-cml-comment: false
       watermark-title: "Q-Drop training — dropout"
       artifact-suffix: dropout
 
   report-dropout:
-    name: Report (dropout, A6000)
+    name: Report (dropout, P6000)
     needs: train-dropout
-    runs-on: [self-hosted, A6000]
+    runs-on: [self-hosted, P6000]
     if: always() && needs.train-dropout.result == 'success'
     permissions:
       # On `push` events CML targets commit comments
@@ -253,7 +253,7 @@ jobs:
           cml ci
           cml comment update --watermark-title="$WATERMARK_TITLE" report.md
 
-      - name: Re-upload dropout report (with charts regenerated on A6000)
+      - name: Re-upload dropout report (with charts regenerated on P6000)
         uses: actions/upload-artifact@v4
         if: always()
         with:
@@ -281,9 +281,9 @@ jobs:
       artifact-suffix: both
 
   report-both:
-    name: Report (both, A6000)
+    name: Report (both, P6000)
     needs: train-both
-    runs-on: [self-hosted, A6000]
+    runs-on: [self-hosted, P6000]
     if: always() && needs.train-both.result == 'success'
     permissions:
       # On `push` events CML targets commit comments
@@ -352,7 +352,7 @@ jobs:
           cml ci
           cml comment update --watermark-title="$WATERMARK_TITLE" report.md
 
-      - name: Re-upload both report (with charts regenerated on A6000)
+      - name: Re-upload both report (with charts regenerated on P6000)
         uses: actions/upload-artifact@v4
         if: always()
         with:
