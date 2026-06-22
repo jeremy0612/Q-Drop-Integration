@@ -24,6 +24,9 @@ from torch.nn import LayerNorm, Linear, Parameter
 from torch_geometric.nn import MessagePassing
 from torch_geometric.utils import add_self_loops, softmax
 
+from qdrop.specs.pennylane_torch import PennyLaneTorchSpecFactory
+from qdrop.types import QDropDropoutState
+
 
 def _make_device(n_qubits: int):
     """Return (device, diff_method) for the fastest working backend."""
@@ -40,28 +43,74 @@ def _select_qubits(dim: int, max_qubits: int = 8) -> int:
     return 4
 
 
-def _build_vqc(n_qubits: int, n_layers: int) -> nn.Module:
-    """Build the variational quantum circuit for node embedding.
+class QGATVQCAdapter(nn.Module):
+    """Q-Drop-compatible wrapper around the QGAT node-embedding VQC.
 
-    Circuit: AngleEmbedding(Y) → [RY, RZ, CZ-ring] × n_layers → PauliZ expectations.
-    Weight shape: (n_layers, n_qubits, 2)  — 2 rotation angles per qubit per layer.
+    Mirrors ``QuantumCircuitAdapter`` (used by QGCN) so the shared Q-Drop
+    runtime can statistic-prune and wire-dropout the VQC rotation angles.
+    The circuit is AngleEmbedding(Y) → [RY, RZ, CZ-ring] × n_layers → PauliZ
+    expectations, with weight shape ``(n_layers, n_qubits, 2)``. The two
+    trailing angles per (layer, wire) are masked together when a wire is
+    dropped or pruned, so masking stays wire-aligned exactly like QGCN.
+
+    Q-Drop is applied to the node VQC only (the primary per-node quantum
+    embedding), mirroring QGCN's single quantum layer. The attention circuit
+    is left untouched.
     """
-    dev, diff = _make_device(n_qubits)
 
-    @qml.qnode(dev, interface="torch", diff_method=diff)
-    def _circuit(inputs, q_weights):
-        qml.AngleEmbedding(inputs, wires=range(n_qubits), rotation="Y")
-        for layer in range(n_layers):
-            for q in range(n_qubits):
-                qml.RY(q_weights[layer, q, 0], wires=q)
-                qml.RZ(q_weights[layer, q, 1], wires=q)
-            for q in range(n_qubits - 1):
-                qml.CZ(wires=[q, q + 1])
-            if n_qubits > 2:
-                qml.CZ(wires=[n_qubits - 1, 0])
-        return [qml.expval(qml.PauliZ(q)) for q in range(n_qubits)]
+    def __init__(self, n_qubits: int, n_layers: int):
+        super().__init__()
+        self.n_qubits = n_qubits
+        self.n_layers = n_layers
+        self.qdrop_name = self.__class__.__name__
 
-    return qml.qnn.TorchLayer(_circuit, {"q_weights": (n_layers, n_qubits, 2)})
+        dev, diff = _make_device(n_qubits)
+
+        @qml.qnode(dev, interface="torch", diff_method=diff)
+        def _circuit(inputs, weights):
+            qml.AngleEmbedding(inputs, wires=range(n_qubits), rotation="Y")
+            for layer in range(n_layers):
+                for q in range(n_qubits):
+                    qml.RY(weights[layer, q, 0], wires=q)
+                    qml.RZ(weights[layer, q, 1], wires=q)
+                for q in range(n_qubits - 1):
+                    qml.CZ(wires=[q, q + 1])
+                if n_qubits > 2:
+                    qml.CZ(wires=[n_qubits - 1, 0])
+            return [qml.expval(qml.PauliZ(q)) for q in range(n_qubits)]
+
+        self.quantum_layer = qml.qnn.TorchLayer(_circuit, {"weights": (n_layers, n_qubits, 2)})
+        self.register_buffer("forward_output_mask", torch.ones(n_qubits, dtype=torch.float32))
+
+    @property
+    def weights(self) -> nn.Parameter:
+        """Expose the trainable quantum weights (used by the Q-Drop spec)."""
+        return self.quantum_layer.weights
+
+    def mask_builder(self, wire_ids):
+        mask = torch.zeros(
+            self.n_layers, self.n_qubits, 2, dtype=torch.bool, device=self.weights.device
+        )
+        for wire_index in wire_ids:
+            if 0 <= wire_index < self.n_qubits:
+                mask[:, wire_index, :] = True
+        return mask
+
+    def set_forward_mask(self, dropout_state: QDropDropoutState | None) -> None:
+        self.forward_output_mask.fill_(1.0)
+        if dropout_state is None or not dropout_state.enabled:
+            return
+        for wire_index in dropout_state.dropped_wires:
+            if 0 <= wire_index < self.n_qubits:
+                self.forward_output_mask[wire_index] = 0.0
+
+    def qdrop_layer_spec(self):
+        return PennyLaneTorchSpecFactory.from_adapter(self)
+
+    def forward(self, inputs: torch.Tensor) -> torch.Tensor:
+        quantum_outputs = self.quantum_layer(inputs)
+        quantum_outputs = torch.nan_to_num(quantum_outputs, nan=0.0, posinf=0.0, neginf=0.0)
+        return quantum_outputs * self.forward_output_mask.to(quantum_outputs.device)
 
 
 def _build_attention_circuit(n_qubits: int, n_layers: int) -> nn.Module:
@@ -135,7 +184,7 @@ class QGATConv(MessagePassing):
             self.feature_reduction = None
 
         self.vqc_norm = LayerNorm(self.n_qubits)
-        self.vqc = _build_vqc(self.n_qubits, n_layers)
+        self.vqc = QGATVQCAdapter(self.n_qubits, n_layers)
         self.bias = Parameter(torch.zeros(self.n_qubits))
 
         # ── Attention path ────────────────────────────────────────────────────

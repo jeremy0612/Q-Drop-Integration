@@ -90,19 +90,19 @@ def draw_qgcn(ax):
 
     # pooling
     pool_y = 6.8
-    draw_box(ax, cx, pool_y, W, H, "Global Mean Pool",
-             "[B, n_qubits]", C_POOL, sublabel="or multiscale ×3")
+    draw_box(ax, cx, pool_y, W, H, "Global Mean Pool", C_POOL,
+             sublabel="[B, n_qubits]  (or multiscale ×3)")
     arrow(ax, cx, 7.7 - H/2, cx, pool_y + H/2)
 
     # classifier
     clf_y = 5.9
-    draw_box(ax, cx, clf_y, W, H, "Linear Classifier",
-             "[B, output_dim]", C_CLF)
+    draw_box(ax, cx, clf_y, W, H, "Linear Classifier", C_CLF,
+             sublabel="[B, output_dim]")
     arrow(ax, cx, pool_y - H/2, cx, clf_y + H/2)
 
     # output
     out_y = 5.0
-    draw_box(ax, cx, out_y, W, H, "Logit / Prediction", "", C_CLF, fontsize=8)
+    draw_box(ax, cx, out_y, W, H, "Logit / Prediction", C_CLF, fontsize=8)
     arrow(ax, cx, clf_y - H/2, cx, out_y + H/2)
 
     # legend
@@ -167,7 +167,7 @@ def draw_qgat(ax):
     agg_y = 7.7
     cx_mid = (cx_node + cx_attn) / 2
     draw_box(ax, cx_mid, agg_y, 2.4, H,
-             "Weighted Aggregation", "Σ α_ij · hj + bias", C_GRAPH)
+             "Weighted Aggregation", C_GRAPH, sublabel="Σ α_ij · hj + bias")
     arrow(ax, cx_node, 9.5 - H/2, cx_node, agg_y + H/2 + 0.05)
     ax.annotate("", xy=(cx_mid - 1.2 + 0.05, agg_y + H/2),
                 xytext=(cx_attn, 8.6 - H/2),
@@ -178,7 +178,7 @@ def draw_qgat(ax):
     # ── Residual + Norm ──────────────────────────────────────────────────
     res_y = 6.8
     draw_box(ax, cx_mid, res_y, 2.4, H,
-             "LeakyReLU + Residual", "skip connection", C_CLASSIC)
+             "LeakyReLU + Residual", C_CLASSIC, sublabel="skip connection")
     arrow(ax, cx_mid, agg_y - H/2, cx_mid, res_y + H/2)
 
     # repeat bracket
@@ -195,25 +195,25 @@ def draw_qgat(ax):
     # ── Output norm ──────────────────────────────────────────────────────
     norm_y = 5.9
     draw_box(ax, cx_mid, norm_y, 2.4, H,
-             "Output LayerNorm", "[N, n_qubits]", C_CLASSIC)
+             "Output LayerNorm", C_CLASSIC, sublabel="[N, n_qubits]")
     arrow(ax, cx_mid, res_y - H/2, cx_mid, norm_y + H/2)
 
     # ── Multiscale pool ──────────────────────────────────────────────────
     pool_y = 5.0
     draw_box(ax, cx_mid, pool_y, 2.4, H,
-             "Multiscale Pool", "cat(mean, max, add) → [B, 3·n_q]", C_POOL)
+             "Multiscale Pool", C_POOL, sublabel="cat(mean, max, add) → [B, 3·n_q]")
     arrow(ax, cx_mid, norm_y - H/2, cx_mid, pool_y + H/2)
 
     # ── MLP classifier ───────────────────────────────────────────────────
     clf_y = 4.1
     draw_box(ax, cx_mid, clf_y, 2.4, H,
-             "MLP Head", "Linear→LN→ReLU→Dropout × 2", C_CLF)
+             "MLP Head", C_CLF, sublabel="Linear→LN→ReLU→Dropout × 2")
     arrow(ax, cx_mid, pool_y - H/2, cx_mid, clf_y + H/2)
 
     # ── Output ───────────────────────────────────────────────────────────
     out_y = 3.2
     draw_box(ax, cx_mid, out_y, 2.4, H,
-             "Logit / Prediction", "", C_CLF, fontsize=8)
+             "Logit / Prediction", C_CLF, fontsize=8)
     arrow(ax, cx_mid, clf_y - H/2, cx_mid, out_y + H/2)
 
     # legend

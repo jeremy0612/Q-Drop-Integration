@@ -1,0 +1,18 @@
+[
+  {
+    "variant": "qgcn_baseline",
+    "dataset": "mutag",
+    "n_seeds": 5,
+    "seeds": "123,2024,42,456,789",
+    "accuracy_mean": 0.8011,
+    "accuracy_std": 0.0136,
+    "f1_mean": 0.8542,
+    "f1_std": 0.014,
+    "roc_auc_mean": 0.7902,
+    "roc_auc_std": 0.0095,
+    "precision_mean": 0.8411,
+    "precision_std": 0.0111,
+    "recall_mean": 0.8813,
+    "recall_std": 0.0377
+  }
+]

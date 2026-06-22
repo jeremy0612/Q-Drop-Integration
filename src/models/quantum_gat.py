@@ -90,8 +90,19 @@ class QGAT(Module):
             self.classifier = Linear(pool_out, output_dims)
 
     def qdrop_layers(self):
-        """Q-Drop interface: QGAT has no Q-Drop layers."""
-        return []
+        """Q-Drop interface: expose each QGATConv's node VQC adapter.
+
+        Each adapter wraps the VQC rotation angles so the shared Q-Drop
+        runtime can statistic-prune / wire-dropout them, mirroring QGCN.
+        """
+        quantum_layers = []
+        for layer_index, conv in enumerate(self.layers):
+            vqc = getattr(conv, "vqc", None)
+            if vqc is None or not hasattr(vqc, "qdrop_layer_spec"):
+                continue
+            vqc.qdrop_name = f"layers.{layer_index}.vqc"
+            quantum_layers.append(vqc)
+        return quantum_layers
 
     def forward(self, x: torch.Tensor, edge_index: torch.Tensor, batch: torch.Tensor) -> torch.Tensor:
         h = x

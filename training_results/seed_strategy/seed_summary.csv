@@ -1,0 +1,2 @@
+variant,dataset,n_seeds,seeds,accuracy_mean,accuracy_std,f1_mean,f1_std,roc_auc_mean,roc_auc_std,precision_mean,precision_std,recall_mean,recall_std
+qgcn_baseline,mutag,5,"123,2024,42,456,789",0.8011,0.0136,0.8542,0.014,0.7902,0.0095,0.8411,0.0111,0.8813,0.0377
