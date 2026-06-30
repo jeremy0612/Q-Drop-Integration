@@ -63,20 +63,23 @@ permissions:
 
 jobs:
   train-pruning:
-    name: Train (pruning, A6000)
+    name: Train (qfi, A6000)
     uses: ./.github/workflows/_train_quantum_one.yml
     secrets: inherit
     with:
-      algorithm: pruning
+      # ponytail: this job slot now runs QFI-Drop (replaces the no-op gradient
+      # pruning). artifact-suffix stays "pruning" so the report/aggregator wiring
+      # downstream keeps matching — rename all ~20 sites only if it ever confuses.
+      algorithm: qfi
       runner-labels: '["self-hosted","A6000"]'
       epochs: ${{ github.event.inputs.epochs || '100' }}
       n_qubits: ${{ github.event.inputs.n_qubits || '' }}
       post-cml-comment: false
-      watermark-title: "Q-Drop training — pruning"
+      watermark-title: "Q-Drop training — qfi"
       artifact-suffix: pruning
 
   report-pruning:
-    name: Report (pruning, A6000)
+    name: Report (qfi, A6000)
     needs: train-pruning
     runs-on: [self-hosted, A6000]
     if: always() && needs.train-pruning.result == 'success'
@@ -87,8 +90,8 @@ jobs:
       contents: write
       pull-requests: write
     env:
-      ALGORITHM: pruning
-      WATERMARK_TITLE: "Q-Drop training — pruning"
+      ALGORITHM: qfi
+      WATERMARK_TITLE: "Q-Drop training — qfi"
       OUTPUT_DIR: ci_results
       MPLCONFIGDIR: /tmp/matplotlib
     steps:
