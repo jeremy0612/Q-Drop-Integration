@@ -42,6 +42,14 @@ class TorchQDropRuntime:
     def quantum_scalar_count(self) -> int:
         return self.session.quantum_scalar_count
 
+    def register_adapters(self, adapters) -> None:
+        """adapters: iterable of (layer_id, tensor_id, adapter) for QFI-Drop probing."""
+        for layer_id, tensor_id, adapter in adapters:
+            self.session._qfi_adapters[(layer_id, tensor_id)] = adapter
+
+    def set_probe_batch(self, probe_inputs) -> None:
+        self.session._qfi_probe = probe_inputs
+
     def start_epoch(self, epoch: int) -> None:
         self.session.start_epoch(epoch)
 

@@ -5,7 +5,7 @@ from __future__ import annotations
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, Optional, Protocol, Tuple, runtime_checkable
 
-SUPPORTED_QDROP_ALGORITHMS = {"baseline", "pruning", "dropout", "both"}
+SUPPORTED_QDROP_ALGORITHMS = {"baseline", "pruning", "dropout", "both", "qfi"}
 
 MaskBuilder = Callable[[Tuple[int, ...]], Any]
 ForwardMaskSetter = Callable[[Optional["QDropDropoutState"]], None]
@@ -21,6 +21,12 @@ class QDropConfig:
     dropout_prob: float = 0.5
     n_drop_wires: int = 1
     enable_forward_mask: bool = True
+    # QFI-Drop (algorithm="qfi")
+    qfi_reg: float = 1e-4
+    spectral_ratio: float = 1e-3
+    energy_threshold: float = 0.5
+    probe_batch_size: int = 32
+    reprobe_every: int = 1
     sanitize_quantum_gradients: bool = True
     sanitize_quantum_parameters: bool = True
 

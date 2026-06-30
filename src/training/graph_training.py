@@ -388,7 +388,7 @@ def snapshot_qdrop_state(qdrop_manager: TorchQDropRuntime, epoch: int) -> dict:
     state = qdrop_manager.describe_state()
     active_dropout_states = state["active_dropout_states"]
     dropped_wire_count = sum(len(dropped_wires) for dropped_wires in active_dropout_states.values())
-    return {
+    snapshot = {
         "epoch": epoch,
         "mode": state["active_step_mode"],
         "phase": "accumulate" if state["accumulate_phase"] else "prune",
@@ -406,6 +406,21 @@ def snapshot_qdrop_state(qdrop_manager: TorchQDropRuntime, epoch: int) -> dict:
             layer_id: list(dropped_wires) for layer_id, dropped_wires in active_dropout_states.items()
         },
     }
+    cache = getattr(qdrop_manager.session, "_qfi_cache", None)
+    if cache:
+        kappas, frozen = [], 0
+        for matrix, leverage in cache.values():
+            survive = leverage >= qdrop_manager.config.energy_threshold
+            frozen += int((~survive).sum())
+            if survive.any():
+                idx = survive.nonzero(as_tuple=True)[0]
+                ev = torch.linalg.eigvalsh(
+                    matrix.index_select(0, idx).index_select(1, idx)
+                ).clamp_min(1e-12)
+                kappas.append(float((ev.max() / ev.min()).log10()))
+        snapshot["qfi_frozen_gates"] = frozen
+        snapshot["qfi_log10_condition"] = sum(kappas) / len(kappas) if kappas else 0.0
+    return snapshot
 
 
 def run_epoch(
@@ -531,6 +546,20 @@ def train_fold(
             f"quantum tensors: {qdrop_manager.quantum_param_count} | "
             f"quantum scalars: {qdrop_manager.quantum_scalar_count}"
         )
+
+    if config.algorithm == "qfi":
+        adapters = model.qdrop_layers()
+        qdrop_manager.register_adapters([(a.qdrop_name, "weights", a) for a in adapters])
+        # ponytail: probe = first conv's preprocessing of one training batch, reused for every
+        # layer (shape-compatible; deeper layers see a different input distribution — upgrade to
+        # per-layer forward-hook capture if leverage looks wrong).
+        first_conv = model.layers[0]
+        with torch.no_grad():
+            probe_x = next(iter(train_loader)).x.to(device)[:32]
+            if first_conv.feature_reduction is not None:
+                probe_x = first_conv.feature_reduction(probe_x)
+            probe_x = torch.tanh(first_conv.input_norm(probe_x)) * torch.pi
+        qdrop_manager.set_probe_batch(probe_x.detach().cpu())
 
     stopper = EarlyStopping(config.early_stop_patience)
     train_curve = []
@@ -849,7 +878,7 @@ def build_train_parser(
         "--algorithm",
         type=str,
         default="baseline",
-        choices=["baseline", "pruning", "dropout", "both"],
+        choices=["baseline", "pruning", "dropout", "both", "qfi"],
         help="Q-Drop algorithm mode for graph quantum weights",
     )
     parser.add_argument("--accumulate-window", type=int, default=10)

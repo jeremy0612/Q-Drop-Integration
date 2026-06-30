@@ -33,6 +33,10 @@ class QDropSession:
         self.current_epoch = 0
         self.dropout_enabled = False
         self._active_step_mode = "passthrough"
+        # QFI-Drop state: per-tensor (F, leverage) cache, adapter refs, probe batch.
+        self._qfi_cache: Dict[Tuple[str, str], Tuple] = {}
+        self._qfi_adapters: Dict[Tuple[str, str], object] = {}
+        self._qfi_probe = None
 
     @property
     def quantum_param_count(self) -> int:
@@ -81,9 +85,24 @@ class QDropSession:
         dropped_wires = tuple(sorted(random.sample(range(num_wires), k=n_drop)))
         return QDropDropoutState(enabled=True, dropped_wires=dropped_wires)
 
+    def refresh_qfi(self) -> None:
+        """Probe the data-averaged QFIM + spectral leverage for each quantum tensor."""
+        if self._qfi_probe is None:
+            return
+        from .qfi import spectral_leverage
+        from .qfi_metric import compute_qfim
+        for key, adapter in self._qfi_adapters.items():
+            F = compute_qfim(adapter, self._qfi_probe)
+            self._qfi_cache[key] = (F, spectral_leverage(F, self.config.spectral_ratio))
+
     def start_epoch(self, epoch: int) -> None:
         self.current_epoch = epoch
         self.clear_forward_masks()
+
+        if self.config.algorithm == "qfi":
+            if (epoch - 1) % max(1, self.config.reprobe_every) == 0:
+                self.refresh_qfi()
+            return
 
         if self.config.algorithm not in {"dropout", "both"}:
             return
@@ -130,6 +149,18 @@ class QDropSession:
 
         if self.config.sanitize_quantum_gradients:
             result = unit.sanitize_gradient(result)
+
+        if self.config.algorithm == "qfi":
+            cached = self._qfi_cache.get((layer_id, tensor_id))
+            if cached is None:
+                return result
+            from .qfi import prune_and_precondition
+            F, leverage = cached
+            return prune_and_precondition(
+                result, F, leverage,
+                energy_threshold=self.config.energy_threshold,
+                reg=self.config.qfi_reg,
+            )
 
         if self.config.algorithm in {"dropout", "both"}:
             dropout_state = self.active_dropout_states.get(layer_id)
