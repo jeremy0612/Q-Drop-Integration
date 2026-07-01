@@ -31,6 +31,10 @@ on:
         description: "Suffix appended to the upload-artifact name"
         type: string
         required: true
+      datasets:
+        description: "Space-separated dataset keys to train"
+        type: string
+        default: "imdb_multi imdb_binary nci1 mutag proteins"
 
 jobs:
   train:
@@ -47,6 +51,7 @@ jobs:
       ALGORITHM: ${{ inputs.algorithm }}
       EPOCHS: ${{ inputs.epochs }}
       N_QUBITS: ${{ inputs.n_qubits }}
+      DATASETS: ${{ inputs.datasets }}
       WATERMARK_TITLE: ${{ inputs.watermark-title }}
 
     steps:
@@ -223,7 +228,7 @@ jobs:
           if [ -n "$N_QUBITS" ]; then
             echo "Quantum width    : $N_QUBITS"
             python src/train_quantum_models.py \
-              --datasets imdb_multi imdb_binary nci1 mutag proteins \
+              --datasets $DATASETS \
               --epochs "$EPOCHS" \
               --algorithm "$ALGORITHM" \
               --n-qubits "$N_QUBITS" \
@@ -233,7 +238,7 @@ jobs:
               --seed 42
           else
             python src/train_quantum_models.py \
-              --datasets imdb_multi imdb_binary nci1 mutag proteins \
+              --datasets $DATASETS \
               --epochs "$EPOCHS" \
               --algorithm "$ALGORITHM" \
               --output-dir "$OUTPUT_DIR" \
