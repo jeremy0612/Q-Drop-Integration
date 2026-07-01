@@ -2,12 +2,12 @@ name: Quantum Graph Training — QFI-Drop (MUTAG, PROTEINS, NCI1)
 
 # Lean QFI-Drop pipeline across both self-hosted GPUs:
 #
-#   train-proteins    (A6000, n_qubits=16) ──► self-posts CML inline
-#   train-mutag-nci1  (P6000, n_qubits=8)  ──► report-mutag-nci1 (A6000)
+#   train-proteins    (P6000, n_qubits=16) ──► self-posts CML inline
+#   train-mutag-nci1  (P6000, n_qubits=8)  ──► report-mutag-nci1 (P6000)
 #
-# PROTEINS (n_qubits=16) goes to the 48 GB A6000; MUTAG+NCI1 (n_qubits=8) to the
+# PROTEINS (n_qubits=16) goes to the 48 GB P6000; MUTAG+NCI1 (n_qubits=8) to the
 # 24 GB P6000, running in parallel. The P6000 cannot reach CML's asset-upload
-# backend (Cloudflare 400), so its report is generated on a downstream A6000 job.
+# backend (Cloudflare 400), so its report is generated on a downstream P6000 job.
 
 on:
   push:
@@ -48,22 +48,22 @@ permissions:
   pull-requests: write
 
 jobs:
-  # A6000 (48 GB): PROTEINS at n_qubits=16. Posts its own CML report inline.
+  # P6000 (48 GB): PROTEINS at n_qubits=16. Posts its own CML report inline.
   train-proteins:
-    name: Train QFI — PROTEINS (A6000)
+    name: Train QFI — PROTEINS (P6000)
     uses: ./.github/workflows/_train_quantum_one.yml
     secrets: inherit
     with:
       algorithm: qfi
       datasets: proteins
-      runner-labels: '["self-hosted","A6000"]'
+      runner-labels: '["self-hosted","P6000"]'
       epochs: ${{ github.event.inputs.epochs || '100' }}
       n_qubits: ${{ github.event.inputs.n_qubits || '' }}
       post-cml-comment: true
       watermark-title: "QFI-Drop — PROTEINS"
       artifact-suffix: qfi-proteins
 
-  # P6000 (24 GB): MUTAG + NCI1 at n_qubits=8. Report posted downstream on A6000.
+  # P6000 (24 GB): MUTAG + NCI1 at n_qubits=8. Report posted downstream on P6000.
   train-mutag-nci1:
     name: Train QFI — MUTAG+NCI1 (P6000)
     uses: ./.github/workflows/_train_quantum_one.yml
@@ -79,9 +79,9 @@ jobs:
       artifact-suffix: qfi-mutag-nci1
 
   report-mutag-nci1:
-    name: Report QFI — MUTAG+NCI1 (A6000)
+    name: Report QFI — MUTAG+NCI1 (P6000)
     needs: train-mutag-nci1
-    runs-on: [self-hosted, A6000]
+    runs-on: [self-hosted, P6000]
     if: always() && needs.train-mutag-nci1.result == 'success'
     permissions:
       contents: write
