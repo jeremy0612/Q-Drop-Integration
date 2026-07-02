@@ -1,13 +1,9 @@
-name: Quantum Graph Training — QFI-Drop (MUTAG, PROTEINS, NCI1)
+name: Quantum Graph Training — Baseline vs QFI (MUTAG, PROTEINS)
 
-# Lean QFI-Drop pipeline across both self-hosted GPUs:
-#
-#   train-proteins    (P6000, n_qubits=16) ──► self-posts CML inline
-#   train-mutag-nci1  (P6000, n_qubits=8)  ──► report-mutag-nci1 (P6000)
-#
-# PROTEINS (n_qubits=16) goes to the 48 GB P6000; MUTAG+NCI1 (n_qubits=8) to the
-# 24 GB P6000, running in parallel. The P6000 cannot reach CML's asset-upload
-# backend (Cloudflare 400), so its report is generated on a downstream P6000 job.
+# Two P6000 jobs, MUTAG + PROTEINS each: one --algorithm baseline, one qfi. Each
+# job trains, then the reusable generates its CML report (metrics table +
+# best-fold loss/accuracy curves) and posts it inline under its own watermark so
+# the baseline and QFI comments stay as two independent sticky updates.
 
 on:
   push:
@@ -48,98 +44,30 @@ permissions:
   pull-requests: write
 
 jobs:
-  # P6000 (48 GB): PROTEINS at n_qubits=16. Posts its own CML report inline.
-  train-proteins:
-    name: Train QFI — PROTEINS (P6000)
+  train-baseline:
+    name: Train baseline — MUTAG+PROTEINS (P6000)
     uses: ./.github/workflows/_train_quantum_one.yml
     secrets: inherit
     with:
-      algorithm: qfi
-      datasets: proteins
+      algorithm: baseline
+      datasets: mutag proteins
       runner-labels: '["self-hosted","P6000"]'
       epochs: ${{ github.event.inputs.epochs || '100' }}
       n_qubits: ${{ github.event.inputs.n_qubits || '' }}
       post-cml-comment: true
-      watermark-title: "QFI-Drop — PROTEINS"
-      artifact-suffix: qfi-proteins
+      watermark-title: "Baseline — MUTAG+PROTEINS"
+      artifact-suffix: baseline
 
-  # P6000 (24 GB): MUTAG + NCI1 at n_qubits=8. Report posted downstream on P6000.
-  train-mutag-nci1:
-    name: Train QFI — MUTAG+NCI1 (P6000)
+  train-qfi:
+    name: Train QFI — MUTAG+PROTEINS (P6000)
     uses: ./.github/workflows/_train_quantum_one.yml
     secrets: inherit
     with:
       algorithm: qfi
-      datasets: mutag nci1
+      datasets: mutag proteins
       runner-labels: '["self-hosted","P6000"]'
       epochs: ${{ github.event.inputs.epochs || '100' }}
       n_qubits: ${{ github.event.inputs.n_qubits || '' }}
-      post-cml-comment: false
-      watermark-title: "QFI-Drop — MUTAG+NCI1"
-      artifact-suffix: qfi-mutag-nci1
-
-  report-mutag-nci1:
-    name: Report QFI — MUTAG+NCI1 (P6000)
-    needs: train-mutag-nci1
-    runs-on: [self-hosted, P6000]
-    if: always() && needs.train-mutag-nci1.result == 'success'
-    permissions:
-      contents: write
-      pull-requests: write
-    env:
-      WATERMARK_TITLE: "QFI-Drop — MUTAG+NCI1"
-      OUTPUT_DIR: ci_results
-      MPLCONFIGDIR: /tmp/matplotlib
-    steps:
-      - name: Add npm global bin to PATH
-        run: echo "$HOME/.npm-global/bin" >> $GITHUB_PATH
-
-      - uses: actions/checkout@v4
-
-      - name: Set up Python 3.10
-        uses: actions/setup-python@v5
-        with:
-          python-version: "3.10"
-
-      - name: Install report-only deps
-        run: |
-          pip install --upgrade pip
-          pip install "matplotlib>=3.7.0" "numpy>=1.24.0"
-
-      - name: Download training artifact
-        uses: actions/download-artifact@v4
-        with:
-          name: quantum-graph-metrics-qfi-mutag-nci1-${{ github.run_id }}
-          path: artifact
-
-      - name: Stage results for the report script
-        id: stage
-        run: |
-          mkdir -p "$OUTPUT_DIR"
-          if [ -d artifact/ci_results ]; then
-            cp -r artifact/ci_results/* "$OUTPUT_DIR"/
-          else
-            cp -r artifact/* "$OUTPUT_DIR"/ 2>/dev/null || true
-          fi
-          RESULTS_DIR=$(ls -dt "$OUTPUT_DIR"/quantum_graph_training_* 2>/dev/null | head -1)
-          if [ -z "$RESULTS_DIR" ]; then
-            echo "ERROR: artifact missing quantum_graph_training_* directory"
-            ls -R artifact
-            exit 1
-          fi
-          echo "results-dir=$RESULTS_DIR" >> "$GITHUB_OUTPUT"
-          ls -lah "$RESULTS_DIR"
-
-      - name: Generate CML report
-        env:
-          REPORT_INCLUDE_INLINE_ASSETS: "true"
-          REPORT_PATH: report.md
-          BASELINE_PATH: quantum_graph_baseline.json
-        run: python scripts/generate_cml_report.py
-
-      - name: Post / update CML comment
-        env:
-          REPO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-        run: |
-          cml ci
-          cml comment update --watermark-title="$WATERMARK_TITLE" report.md
+      post-cml-comment: true
+      watermark-title: "QFI-Drop — MUTAG+PROTEINS"
+      artifact-suffix: qfi
