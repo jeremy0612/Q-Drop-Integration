@@ -15,6 +15,10 @@ on:
         description: "CML sticky-comment watermark identifying this report"
         type: string
         required: true
+      algorithm:
+        description: "Algorithm label recorded in the report (baseline | qfi | ...)"
+        type: string
+        default: "baseline"
       runner-labels:
         description: "JSON array of runner labels (must reach the CML backend)"
         type: string
@@ -28,6 +32,7 @@ jobs:
       pull-requests: write
     env:
       WATERMARK_TITLE: ${{ inputs.watermark-title }}
+      ALGORITHM: ${{ inputs.algorithm }}
       OUTPUT_DIR: ci_results
       MPLCONFIGDIR: /tmp/matplotlib
     steps:
@@ -67,6 +72,7 @@ jobs:
             ls -R artifact
             exit 1
           fi
+          echo "RESULTS_DIR=$RESULTS_DIR" >> "$GITHUB_ENV"
           echo "results-dir=$RESULTS_DIR" >> "$GITHUB_OUTPUT"
           ls -lah "$RESULTS_DIR"
 

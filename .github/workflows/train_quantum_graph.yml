@@ -74,6 +74,7 @@ jobs:
     with:
       artifact-suffix: baseline
       watermark-title: "Baseline — MUTAG+PROTEINS"
+      algorithm: baseline
 
   train-qfi:
     name: Train QFI — MUTAG+PROTEINS (P6000)
@@ -98,3 +99,4 @@ jobs:
     with:
       artifact-suffix: qfi
       watermark-title: "QFI-Drop — MUTAG+PROTEINS"
+      algorithm: qfi
