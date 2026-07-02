@@ -270,14 +270,16 @@ jobs:
 
       - name: Post / update CML comment
         if: inputs.post-cml-comment
+        # Best-effort: P6000 can't reach cml's Cloudflare-fronted asset backend
+        # (400 Bad Request), so the post fails there. Training + the report.md
+        # artifact have already succeeded — only the sticky comment is optional,
+        # so don't fail the job over it. This step still works on A6000.
+        continue-on-error: true
         env:
           REPO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           cml ci
-          # `cml comment update` is sticky: it looks for an existing comment
-          # tagged with `--watermark-title` and edits in place, otherwise it
-          # creates a new one. Each algorithm uses its own watermark so the
-          # pruning / dropout / both reports occupy independent comments.
+          # Sticky per --watermark-title: edits its own comment in place.
           cml comment update --watermark-title="$WATERMARK_TITLE" report.md
 
       - name: Upload training artifacts

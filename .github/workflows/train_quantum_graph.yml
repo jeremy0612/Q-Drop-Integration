@@ -1,9 +1,14 @@
 name: Quantum Graph Training — Baseline vs QFI (MUTAG, PROTEINS)
 
-# Two P6000 jobs, MUTAG + PROTEINS each: one --algorithm baseline, one qfi. Each
-# job trains, then the reusable generates its CML report (metrics table +
-# best-fold loss/accuracy curves) and posts it inline under its own watermark so
-# the baseline and QFI comments stay as two independent sticky updates.
+# Train on P6000, report on A6000:
+#
+#   train-baseline (P6000) ──► report-baseline (A6000)
+#   train-qfi      (P6000) ──► report-qfi      (A6000)
+#
+# Both train --algorithm {baseline,qfi} on MUTAG + PROTEINS. P6000 cannot reach
+# cml's Cloudflare-fronted asset backend, so each training job just uploads its
+# artifact and the paired A6000 job regenerates the report (metrics table +
+# best-fold loss/accuracy curves) and posts it under its own watermark.
 
 on:
   push:
@@ -17,6 +22,7 @@ on:
       - "scripts/generate_cml_report.py"
       - ".github/workflows/train_quantum_graph.yml"
       - ".github/workflows/_train_quantum_one.yml"
+      - ".github/workflows/_report_one.yml"
   pull_request:
     branches: [feat/torch_qdrop]
     paths:
@@ -28,6 +34,7 @@ on:
       - "scripts/generate_cml_report.py"
       - ".github/workflows/train_quantum_graph.yml"
       - ".github/workflows/_train_quantum_one.yml"
+      - ".github/workflows/_report_one.yml"
   workflow_dispatch:
     inputs:
       epochs:
@@ -54,9 +61,19 @@ jobs:
       runner-labels: '["self-hosted","P6000"]'
       epochs: ${{ github.event.inputs.epochs || '100' }}
       n_qubits: ${{ github.event.inputs.n_qubits || '' }}
-      post-cml-comment: true
+      post-cml-comment: false
       watermark-title: "Baseline — MUTAG+PROTEINS"
       artifact-suffix: baseline
+
+  report-baseline:
+    name: Report baseline (A6000)
+    needs: train-baseline
+    if: always() && needs.train-baseline.result == 'success'
+    uses: ./.github/workflows/_report_one.yml
+    secrets: inherit
+    with:
+      artifact-suffix: baseline
+      watermark-title: "Baseline — MUTAG+PROTEINS"
 
   train-qfi:
     name: Train QFI — MUTAG+PROTEINS (P6000)
@@ -68,6 +85,16 @@ jobs:
       runner-labels: '["self-hosted","P6000"]'
       epochs: ${{ github.event.inputs.epochs || '100' }}
       n_qubits: ${{ github.event.inputs.n_qubits || '' }}
-      post-cml-comment: true
+      post-cml-comment: false
       watermark-title: "QFI-Drop — MUTAG+PROTEINS"
       artifact-suffix: qfi
+
+  report-qfi:
+    name: Report QFI (A6000)
+    needs: train-qfi
+    if: always() && needs.train-qfi.result == 'success'
+    uses: ./.github/workflows/_report_one.yml
+    secrets: inherit
+    with:
+      artifact-suffix: qfi
+      watermark-title: "QFI-Drop — MUTAG+PROTEINS"

@@ -1,0 +1,85 @@
+name: _Report One (reusable)
+
+# Regenerates the CML report (metrics table + best-fold curves) from a training
+# artifact and posts it as a sticky comment. Runs on a runner that CAN reach
+# cml's asset backend (A6000) — the P6000 training runners cannot (Cloudflare 400).
+
+on:
+  workflow_call:
+    inputs:
+      artifact-suffix:
+        description: "Suffix of the training artifact to report on"
+        type: string
+        required: true
+      watermark-title:
+        description: "CML sticky-comment watermark identifying this report"
+        type: string
+        required: true
+      runner-labels:
+        description: "JSON array of runner labels (must reach the CML backend)"
+        type: string
+        default: '["self-hosted","A6000"]'
+
+jobs:
+  report:
+    runs-on: ${{ fromJSON(inputs.runner-labels) }}
+    permissions:
+      contents: write
+      pull-requests: write
+    env:
+      WATERMARK_TITLE: ${{ inputs.watermark-title }}
+      OUTPUT_DIR: ci_results
+      MPLCONFIGDIR: /tmp/matplotlib
+    steps:
+      - name: Add npm global bin to PATH
+        run: echo "$HOME/.npm-global/bin" >> $GITHUB_PATH
+
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Install report-only deps
+        run: |
+          pip install --upgrade pip
+          pip install "matplotlib>=3.7.0" "numpy>=1.24.0"
+
+      - name: Download training artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: quantum-graph-metrics-${{ inputs.artifact-suffix }}-${{ github.run_id }}
+          path: artifact
+
+      - name: Stage results for the report script
+        id: stage
+        run: |
+          mkdir -p "$OUTPUT_DIR"
+          if [ -d artifact/ci_results ]; then
+            cp -r artifact/ci_results/* "$OUTPUT_DIR"/
+          else
+            cp -r artifact/* "$OUTPUT_DIR"/ 2>/dev/null || true
+          fi
+          RESULTS_DIR=$(ls -dt "$OUTPUT_DIR"/quantum_graph_training_* 2>/dev/null | head -1)
+          if [ -z "$RESULTS_DIR" ]; then
+            echo "ERROR: artifact missing quantum_graph_training_* directory"
+            ls -R artifact
+            exit 1
+          fi
+          echo "results-dir=$RESULTS_DIR" >> "$GITHUB_OUTPUT"
+          ls -lah "$RESULTS_DIR"
+
+      - name: Generate CML report
+        env:
+          REPORT_INCLUDE_INLINE_ASSETS: "true"
+          REPORT_PATH: report.md
+          BASELINE_PATH: quantum_graph_baseline.json
+        run: python scripts/generate_cml_report.py
+
+      - name: Post / update CML comment
+        env:
+          REPO_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          cml ci
+          cml comment update --watermark-title="$WATERMARK_TITLE" report.md
