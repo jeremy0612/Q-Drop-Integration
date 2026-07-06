@@ -1,11 +1,11 @@
 name: Quantum Graph Training — Baseline vs QFI (MUTAG, PROTEINS)
 
-# Train on P6000, report on A6000:
+# Train on A6000, report on A6000:
 #
-#   train-baseline (P6000) ──► report-baseline (A6000)
-#   train-qfi      (P6000) ──► report-qfi      (A6000)
+#   train-baseline (A6000) ──► report-baseline (A6000)
+#   train-qfi      (A6000) ──► report-qfi      (A6000)
 #
-# Both train --algorithm {baseline,qfi} on MUTAG + PROTEINS. P6000 cannot reach
+# Both train --algorithm {baseline,qfi} on MUTAG + PROTEINS. A6000 cannot reach
 # cml's Cloudflare-fronted asset backend, so each training job just uploads its
 # artifact and the paired A6000 job regenerates the report (metrics table +
 # best-fold loss/accuracy curves) and posts it under its own watermark.
@@ -52,13 +52,13 @@ permissions:
 
 jobs:
   train-baseline:
-    name: Train baseline — MUTAG+PROTEINS (P6000)
+    name: Train baseline — MUTAG+PROTEINS (A6000)
     uses: ./.github/workflows/_train_quantum_one.yml
     secrets: inherit
     with:
       algorithm: baseline
       datasets: mutag proteins
-      runner-labels: '["self-hosted","P6000"]'
+      runner-labels: '["self-hosted","A6000"]'
       epochs: ${{ github.event.inputs.epochs || '100' }}
       n_qubits: ${{ github.event.inputs.n_qubits || '' }}
       post-cml-comment: false
@@ -77,13 +77,13 @@ jobs:
       algorithm: baseline
 
   train-qfi:
-    name: Train QFI — MUTAG+PROTEINS (P6000)
+    name: Train QFI — MUTAG+PROTEINS (A6000)
     uses: ./.github/workflows/_train_quantum_one.yml
     secrets: inherit
     with:
       algorithm: qfi
       datasets: mutag proteins
-      runner-labels: '["self-hosted","P6000"]'
+      runner-labels: '["self-hosted","A6000"]'
       epochs: ${{ github.event.inputs.epochs || '100' }}
       n_qubits: ${{ github.event.inputs.n_qubits || '' }}
       post-cml-comment: false
