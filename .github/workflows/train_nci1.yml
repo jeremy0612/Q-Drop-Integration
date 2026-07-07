@@ -1,0 +1,70 @@
+name: NCI1 — Baseline vs QFI (fire-and-forget)
+
+# start:   launches training DETACHED on the runner and exits in seconds —
+#          no runner slot held, no Actions timeout for long training.
+# collect: dispatch again when training is done; uploads results as artifact.
+#          DONE file in the artifact = training completed.
+
+on:
+  workflow_dispatch:
+    inputs:
+      action:
+        description: "start = launch detached training | collect = upload finished results"
+        required: true
+        default: "start"
+        type: choice
+        options: [start, collect]
+      epochs:
+        description: "Max training epochs per fold (start only)"
+        required: false
+        default: "100"
+
+permissions:
+  contents: read
+
+jobs:
+  start:
+    if: inputs.action == 'start'
+    runs-on: [self-hosted, P6000]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python 3.10
+        # Also fixes PATH for the detached process: deps persist in the
+        # setup-python tool cache, not the system python.
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.10"
+
+      - name: Verify persistent runner env
+        # ponytail: runner keeps site-packages across jobs — guard, don't
+        # reinstall. If this fails, run the main training pipeline once.
+        run: python -c "import torch, torch_geometric, pennylane, sklearn, datasets"
+
+      - name: Launch detached training
+        run: |
+          OUT="${{ runner.workspace }}/nci1_results"
+          rm -rf "$OUT" && mkdir -p "$OUT"
+          # ponytail: RUNNER_TRACKING_ID="" stops the runner reaping the child
+          # at job end; results live OUTSIDE the checkout so other workflows'
+          # `git clean` can't delete them mid-training.
+          RUNNER_TRACKING_ID="" EPOCHS="${{ inputs.epochs }}" OUTPUT_DIR="$OUT" \
+            nohup bash scripts/train_nci1.sh > "$OUT/nci1.log" 2>&1 &
+          echo "Launched PID $!. Results -> $OUT"
+          echo "When done (DONE file appears), dispatch this workflow with action=collect."
+
+  collect:
+    if: inputs.action == 'collect'
+    runs-on: [self-hosted, P6000]
+    steps:
+      # No checkout — actions/checkout would `git clean` the workspace.
+      - name: Upload results
+        uses: actions/upload-artifact@v4
+        with:
+          name: nci1-baseline-vs-qfi-${{ github.run_id }}
+          path: |
+            ${{ runner.workspace }}/nci1_results/**/summary.json
+            ${{ runner.workspace }}/nci1_results/nci1.log
+            ${{ runner.workspace }}/nci1_results/DONE
+          retention-days: 30
+          if-no-files-found: error
