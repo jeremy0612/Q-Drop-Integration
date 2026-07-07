@@ -1,0 +1,24 @@
+name: Penny2
+channels:
+  - conda-forge
+  - defaults
+dependencies:
+  - python=3.10
+  - numpy
+  - scipy
+  - matplotlib
+  - scikit-learn
+  - pip
+  - pip:
+      - tensorflow
+      - pennylane==0.32.0
+      - pennylane-lightning==0.32.0
+      - torch==2.0.0
+      - torchvision
+      - torch-geometric
+      - autograd
+      - autoray
+      - fire
+      - tqdm
+      - pandas
+      - h5py

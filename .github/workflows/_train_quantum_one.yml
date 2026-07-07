@@ -225,25 +225,24 @@ jobs:
         run: |
           echo "Q-Drop algorithm : $ALGORITHM"
           echo "Max epochs       : $EPOCHS"
+          # Tuned config for fair baseline-vs-qfi comparison (bug-028):
+          # lr 0.0005 matches the tuned baselines (parser default 0.005 is the
+          # untuned band); strongly-entangling breaks the QFIM==0.25*I
+          # degeneracy of BasicEntangler — without it, qfi never engages.
+          EXTRA=""
           if [ -n "$N_QUBITS" ]; then
             echo "Quantum width    : $N_QUBITS"
-            python src/train_quantum_models.py \
-              --datasets $DATASETS \
-              --epochs "$EPOCHS" \
-              --algorithm "$ALGORITHM" \
-              --n-qubits "$N_QUBITS" \
-              --batch-size 16 \
-              --prune-window 4 \
-              --output-dir "$OUTPUT_DIR" \
-              --seed 42
-          else
-            python src/train_quantum_models.py \
-              --datasets $DATASETS \
-              --epochs "$EPOCHS" \
-              --algorithm "$ALGORITHM" \
-              --output-dir "$OUTPUT_DIR" \
-              --seed 42
+            EXTRA="--n-qubits $N_QUBITS --batch-size 16 --prune-window 4"
           fi
+          python src/train_quantum_models.py \
+            --datasets $DATASETS \
+            --epochs "$EPOCHS" \
+            --algorithm "$ALGORITHM" \
+            --lr 0.0005 \
+            --use-strongly-entangling \
+            --output-dir "$OUTPUT_DIR" \
+            --seed 42 \
+            $EXTRA
 
       - name: Locate results directory
         id: locate
