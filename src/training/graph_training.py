@@ -164,6 +164,7 @@ class GraphTrainConfig:
     mlp_dropout: float = 0.5
     use_residual: bool = False
     use_strongly_entangling: bool = False
+    embedding_rotation: str = "X"
     model_type: str = "qgcn"
     attn_dropout: float = 0.2
 
@@ -297,6 +298,7 @@ def build_model(input_dims: int, config: GraphTrainConfig, n_classes: int = 2) -
         mlp_dropout=config.mlp_dropout,
         use_residual=config.use_residual,
         use_strongly_entangling=config.use_strongly_entangling,
+        embedding_rotation=config.embedding_rotation,
     )
 
 
@@ -687,6 +689,7 @@ def serialize_result_payload(
             "mlp_dropout": config.mlp_dropout,
             "use_residual": config.use_residual,
             "use_strongly_entangling": config.use_strongly_entangling,
+            "embedding_rotation": config.embedding_rotation,
             "model_type": config.model_type,
             "attn_dropout": config.attn_dropout,
         },
@@ -902,6 +905,8 @@ def build_train_parser(
     parser.add_argument("--mlp-dropout", type=float, default=0.5)
     parser.add_argument("--use-residual", action="store_true", default=False)
     parser.add_argument("--use-strongly-entangling", action="store_true", default=False)
+    parser.add_argument("--embedding-rotation", type=str, default="X", choices=["X", "Y", "Z"],
+                        help="AngleEmbedding axis; Y breaks the QFIM degeneracy of the RX entangler (bug-028)")
     parser.add_argument("--model-type", type=str, default="qgcn", choices=["qgcn", "qgat"])
     parser.add_argument("--attn-dropout", type=float, default=0.2)
     return parser
@@ -939,6 +944,7 @@ def config_from_args(args: argparse.Namespace) -> GraphTrainConfig:
         mlp_dropout=args.mlp_dropout,
         use_residual=args.use_residual,
         use_strongly_entangling=args.use_strongly_entangling,
+        embedding_rotation=args.embedding_rotation,
         model_type=args.model_type,
         attn_dropout=args.attn_dropout,
     )

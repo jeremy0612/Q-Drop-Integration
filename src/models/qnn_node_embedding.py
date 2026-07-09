@@ -6,6 +6,8 @@ except ImportError:
     from models.quantum_circuit_adapter import QuantumCircuitAdapter
 
 
-def quantum_net(n_qubits, n_layers, use_strongly_entangling=False):
+def quantum_net(n_qubits, n_layers, use_strongly_entangling=False, embedding_rotation="X"):
     """Create a Q-Drop-compatible quantum node embedding layer."""
-    return QuantumCircuitAdapter(n_qubits=n_qubits, n_layers=n_layers, use_strongly_entangling=use_strongly_entangling)
+    return QuantumCircuitAdapter(n_qubits=n_qubits, n_layers=n_layers,
+                                 use_strongly_entangling=use_strongly_entangling,
+                                 embedding_rotation=embedding_rotation)

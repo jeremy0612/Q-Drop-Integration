@@ -13,12 +13,12 @@ import pennylane as qml
 import torch
 
 
-def _shadow_metric(n_qubits, n_layers, use_se, x, weights):
+def _shadow_metric(n_qubits, n_layers, use_se, x, weights, embedding_rotation="X"):
     dev = qml.device("default.qubit", wires=n_qubits)
 
     @qml.qnode(dev, interface="torch", diff_method="backprop")
     def circuit(w):
-        qml.templates.AngleEmbedding(x, wires=range(n_qubits))
+        qml.templates.AngleEmbedding(x, wires=range(n_qubits), rotation=embedding_rotation)
         template = (qml.templates.StronglyEntanglingLayers if use_se
                     else qml.templates.BasicEntanglerLayers)
         template(w, wires=range(n_qubits))
@@ -37,5 +37,6 @@ def compute_qfim(adapter, probe_inputs: torch.Tensor, max_probe: int = 32) -> to
     rows = probe_inputs.detach().double()[:max_probe]
     # ponytail: rebuilds a shadow qnode per probe row (block-diag needs the embedding angles
     # as constants, not tape params). Fine at once/epoch, B<=32, n<=16; revisit if it dominates.
-    mats = [_shadow_metric(n, adapter.n_layers, use_se, rows[i], w) for i in range(rows.shape[0])]
+    rot = getattr(adapter, "embedding_rotation", "X")
+    mats = [_shadow_metric(n, adapter.n_layers, use_se, rows[i], w, rot) for i in range(rows.shape[0])]
     return torch.stack(mats).mean(dim=0)

@@ -221,28 +221,26 @@ jobs:
           print(f"HF datasets:    {datasets.__version__}")
           PYEOF
 
-      - name: Run training — IMDB-MULTI, IMDB-BINARY & MUTAG & PROTEINS
+      - name: Run training (tuned final config)
         run: |
-          echo "Q-Drop algorithm : $ALGORITHM"
-          echo "Max epochs       : $EPOCHS"
-          # Tuned config for fair baseline-vs-qfi comparison (bug-028):
-          # lr 0.0005 matches the tuned baselines (parser default 0.005 is the
-          # untuned band); strongly-entangling breaks the QFIM==0.25*I
-          # degeneracy of BasicEntangler — without it, qfi never engages.
-          EXTRA=""
-          if [ -n "$N_QUBITS" ]; then
-            echo "Quantum width    : $N_QUBITS"
-            EXTRA="--n-qubits $N_QUBITS --batch-size 16 --prune-window 4"
-          fi
+          # FINAL paper config, tuned via grid + hypothesis test (bug-028):
+          #   lr 0.001, q-depths [2,2], AngleEmbedding Y (breaks the QFIM==0.25*I
+          #   degeneracy of the RX entangler so qfi actually engages), 10 folds,
+          #   n_qubits 8 (override via the n_qubits dispatch input).
+          # SAME cell for baseline & qfi — the only difference is --algorithm.
+          # Keep in sync with scripts/train_nci1.sh.
+          echo "algo=$ALGORITHM datasets=$DATASETS epochs=$EPOCHS nq=${N_QUBITS:-8}"
           python src/train_quantum_models.py \
             --datasets $DATASETS \
-            --epochs "$EPOCHS" \
             --algorithm "$ALGORITHM" \
-            --lr 0.0005 \
-            --use-strongly-entangling \
+            --epochs "$EPOCHS" \
+            --folds 10 \
+            --lr 0.001 \
+            --q-depths 2 2 \
+            --embedding-rotation Y \
+            --n-qubits "${N_QUBITS:-8}" \
             --output-dir "$OUTPUT_DIR" \
-            --seed 42 \
-            $EXTRA
+            --seed 42
 
       - name: Locate results directory
         id: locate

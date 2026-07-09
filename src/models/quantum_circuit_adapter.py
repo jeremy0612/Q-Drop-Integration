@@ -51,11 +51,15 @@ def _select_device_and_diff(n_qubits: int):
 class QuantumCircuitAdapter(nn.Module):
     """Own a PennyLane TorchLayer and expose lazy Q-Drop specs for it."""
 
-    def __init__(self, n_qubits: int, n_layers: int, use_strongly_entangling: bool = False):
+    def __init__(self, n_qubits: int, n_layers: int, use_strongly_entangling: bool = False,
+                 embedding_rotation: str = "X"):
         super().__init__()
         self.n_qubits = n_qubits
         self.n_layers = n_layers
         self.use_strongly_entangling = use_strongly_entangling
+        # "Y" breaks the QFIM==0.25*I degeneracy of X-embedding + RX entangler
+        # (bug-028) at zero parameter cost; "X" is the historical default.
+        self.embedding_rotation = embedding_rotation
         self.qdrop_name = self.__class__.__name__
 
         device, diff_method = _select_device_and_diff(n_qubits)
@@ -63,7 +67,7 @@ class QuantumCircuitAdapter(nn.Module):
         if use_strongly_entangling:
             @qml.qnode(device, interface="torch", diff_method=diff_method)
             def qnode(inputs, weights):
-                qml.templates.AngleEmbedding(inputs, wires=range(n_qubits))
+                qml.templates.AngleEmbedding(inputs, wires=range(n_qubits), rotation=embedding_rotation)
                 qml.templates.StronglyEntanglingLayers(weights, wires=range(n_qubits))
                 return [qml.expval(qml.PauliZ(wire_index)) for wire_index in range(n_qubits)]
 
@@ -71,7 +75,7 @@ class QuantumCircuitAdapter(nn.Module):
         else:
             @qml.qnode(device, interface="torch", diff_method=diff_method)
             def qnode(inputs, weights):
-                qml.templates.AngleEmbedding(inputs, wires=range(n_qubits))
+                qml.templates.AngleEmbedding(inputs, wires=range(n_qubits), rotation=embedding_rotation)
                 qml.templates.BasicEntanglerLayers(weights, wires=range(n_qubits))
                 return [qml.expval(qml.PauliZ(wire_index)) for wire_index in range(n_qubits)]
 

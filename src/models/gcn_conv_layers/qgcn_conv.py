@@ -16,7 +16,8 @@ except ImportError:
 
 
 class QGCNConv(MessagePassing):
-    def __init__(self, in_channels, n_layers, n_qubits=None, use_strongly_entangling=False):
+    def __init__(self, in_channels, n_layers, n_qubits=None, use_strongly_entangling=False,
+                 embedding_rotation="X"):
         super().__init__(aggr='add')  # "Add" aggregation (Step 5).
         
         # Limit qubits to at most 16 for practical quantum simulation
@@ -56,7 +57,9 @@ class QGCNConv(MessagePassing):
         # tensor shape.
         self.input_norm = LayerNorm(n_qubits)
 
-        self.quantum_layer = quantum_net(self.n_qubits, self.n_layers, use_strongly_entangling=use_strongly_entangling)
+        self.quantum_layer = quantum_net(self.n_qubits, self.n_layers,
+                                         use_strongly_entangling=use_strongly_entangling,
+                                         embedding_rotation=embedding_rotation)
         self.qc = self.quantum_layer
         self.bias = Parameter(torch.empty(n_qubits))
         self.reset_parameters()
