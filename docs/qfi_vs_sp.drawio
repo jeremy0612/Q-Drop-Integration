@@ -1,0 +1,115 @@
+<mxfile host="app.diagrams.net" type="device">
+  <diagram name="qfi-vs-sp" id="qfivsp1">
+    <mxGraphModel dx="900" dy="600" grid="1" gridSize="10" guides="1" tooltips="1" connect="1" arrows="1" fold="1" page="1" pageScale="1" pageWidth="1120" pageHeight="900" math="0" shadow="0">
+      <root>
+        <mxCell id="0" />
+        <mxCell id="1" parent="0" />
+
+        <mxCell id="title" value="Gate Pruning for Quantum GNNs: Statistical Pruning vs. QFI-Pruning" style="text;html=1;align=center;verticalAlign=middle;fontSize=17;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="160" y="20" width="800" height="30" as="geometry" />
+        </mxCell>
+
+        <!-- shared input -->
+        <mxCell id="inp" value="Mini-batch of graphs&#10;node-level VQC evaluated per node&#10;quantum gradients &#8711;&#966;L (parameter-shift)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#dae8fc;strokeColor=#6c8ebf;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="380" y="66" width="360" height="60" as="geometry" />
+        </mxCell>
+
+        <!-- lane headers -->
+        <mxCell id="hL" value="Original Statistical Pruning (SP)&#10;signal = gradient magnitude (slope)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=13;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="110" y="150" width="380" height="50" as="geometry" />
+        </mxCell>
+        <mxCell id="hR" value="Geometry-Adapted QFI-Pruning (ours)&#10;signal = quantum information geometry (curvature)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=13;fontStyle=1;" vertex="1" parent="1">
+          <mxGeometry x="630" y="150" width="380" height="50" as="geometry" />
+        </mxCell>
+
+        <!-- replaces arrow -->
+        <mxCell id="repl" value="replaces" style="endArrow=classic;html=1;dashed=1;strokeColor=#999999;fontSize=11;fontStyle=2;" edge="1" parent="1">
+          <mxGeometry relative="1" as="geometry">
+            <mxPoint x="490" y="175" as="sourcePoint" />
+            <mxPoint x="630" y="175" as="targetPoint" />
+          </mxGeometry>
+        </mxCell>
+
+        <!-- LEFT lane steps -->
+        <mxCell id="L1" value="&#9312;  Per-gate gradient magnitude&#10;|&#8711;&#952;&#7522; L|" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="130" y="220" width="340" height="56" as="geometry" />
+        </mxCell>
+        <mxCell id="L2" value="&#9313;  Accumulate over sliding window m&#10;buffer of steps n &#8230; n+m" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="130" y="308" width="340" height="56" as="geometry" />
+        </mxCell>
+        <mxCell id="L3" value="&#9314;  &#8467;&#8321;-normalize &#8594; update prob&#10;p&#7522; = &#7501;&#7522; / &#931;&#11388; &#7501;&#11388;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="130" y="396" width="340" height="56" as="geometry" />
+        </mxCell>
+        <mxCell id="L4" value="&#9315;  Sample keep-set by pruning ratio &#961;_t&#10;annealed &#961;_(t+1) = min(&#961; &#183; e^0.1, 1)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="130" y="484" width="340" height="56" as="geometry" />
+        </mxCell>
+        <mxCell id="L5" value="&#9316;  Freeze low-magnitude gates&#10;zero their gradients" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#ffe6cc;strokeColor=#d79b00;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="130" y="572" width="340" height="56" as="geometry" />
+        </mxCell>
+        <mxCell id="L6" value="&#9317;  Plain gradient step on survivors" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#fff2cc;strokeColor=#d6b656;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="130" y="660" width="340" height="48" as="geometry" />
+        </mxCell>
+
+        <!-- RIGHT lane steps -->
+        <mxCell id="R1" value="&#9312;  Probe data-averaged QFIM&#10;F = mean&#7525; F_FS(z&#7525;)   (once per epoch)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="650" y="220" width="340" height="56" as="geometry" />
+        </mxCell>
+        <mxCell id="R2" value="&#9313;  Eigendecompose F = U&#923;U&#7488;&#10;retain K = { i : &#955;&#7522; &#8805; &#954; &#183; &#955;_max }" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="650" y="308" width="340" height="56" as="geometry" />
+        </mxCell>
+        <mxCell id="R3" value="&#9314;  Spectral leverage&#10;e&#11388; = &#931;&#7522;&#8712;K U&#11388;&#7522;&#178;   &#8712; [0,1]" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="650" y="396" width="340" height="56" as="geometry" />
+        </mxCell>
+        <mxCell id="R4" value="&#9315;  Freeze gates with e&#11388; &lt; &#964;&#10;(energy in null eigendirections = barren)" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="650" y="484" width="340" height="56" as="geometry" />
+        </mxCell>
+        <mxCell id="R5" value="&#9316;  QNG-precondition survivors&#10;g&#8348; &#8592; (F_SS + &#949;I)&#8315;&#185; g&#8348;" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="650" y="572" width="340" height="56" as="geometry" />
+        </mxCell>
+        <mxCell id="R6" value="&#9317;  Natural-gradient step on survivors" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#b9e0b0;strokeColor=#82b366;fontSize=12;" vertex="1" parent="1">
+          <mxGeometry x="650" y="660" width="340" height="48" as="geometry" />
+        </mxCell>
+
+        <!-- input split arrows -->
+        <mxCell id="e_inL" style="endArrow=classic;html=1;rounded=0;exitX=0.25;exitY=1;exitDx=0;exitDy=0;" edge="1" parent="1" source="inp" target="hL">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+        <mxCell id="e_inR" style="endArrow=classic;html=1;rounded=0;exitX=0.75;exitY=1;exitDx=0;exitDy=0;" edge="1" parent="1" source="inp" target="hR">
+          <mxGeometry relative="1" as="geometry" />
+        </mxCell>
+
+        <!-- left chain -->
+        <mxCell id="eL0" style="endArrow=classic;html=1;rounded=0;" edge="1" parent="1" source="hL" target="L1"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="eL1" style="endArrow=classic;html=1;rounded=0;" edge="1" parent="1" source="L1" target="L2"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="eL2" style="endArrow=classic;html=1;rounded=0;" edge="1" parent="1" source="L2" target="L3"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="eL3" style="endArrow=classic;html=1;rounded=0;" edge="1" parent="1" source="L3" target="L4"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="eL4" style="endArrow=classic;html=1;rounded=0;" edge="1" parent="1" source="L4" target="L5"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="eL5" style="endArrow=classic;html=1;rounded=0;" edge="1" parent="1" source="L5" target="L6"><mxGeometry relative="1" as="geometry" /></mxCell>
+
+        <!-- right chain -->
+        <mxCell id="eR0" style="endArrow=classic;html=1;rounded=0;" edge="1" parent="1" source="hR" target="R1"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="eR1" style="endArrow=classic;html=1;rounded=0;" edge="1" parent="1" source="R1" target="R2"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="eR2" style="endArrow=classic;html=1;rounded=0;" edge="1" parent="1" source="R2" target="R3"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="eR3" style="endArrow=classic;html=1;rounded=0;" edge="1" parent="1" source="R3" target="R4"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="eR4" style="endArrow=classic;html=1;rounded=0;" edge="1" parent="1" source="R4" target="R5"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="eR5" style="endArrow=classic;html=1;rounded=0;" edge="1" parent="1" source="R5" target="R6"><mxGeometry relative="1" as="geometry" /></mxCell>
+
+        <!-- key difference callouts -->
+        <mxCell id="c1" value="importance = |grad|&#10;big grad may point in a FLAT (barren) direction &#8594; kept anyway" style="rounded=1;whiteSpace=wrap;html=1;dashed=1;fillColor=#f8cecc;strokeColor=#b85450;fontSize=10;align=left;spacingLeft=6;" vertex="1" parent="1">
+          <mxGeometry x="130" y="726" width="340" height="52" as="geometry" />
+        </mxCell>
+        <mxCell id="c2" value="importance = curvature&#10;freezes exactly the barren null directions; survivors rescaled by the local metric" style="rounded=1;whiteSpace=wrap;html=1;dashed=1;fillColor=#d5e8d4;strokeColor=#82b366;fontSize=10;align=left;spacingLeft=6;" vertex="1" parent="1">
+          <mxGeometry x="650" y="726" width="340" height="52" as="geometry" />
+        </mxCell>
+
+        <!-- shared property banner -->
+        <mxCell id="perm" value="Both share one mask/probe across all nodes in a mini-batch &#8594; permutation equivariance preserved" style="rounded=1;whiteSpace=wrap;html=1;fillColor=#f5f5f5;strokeColor=#666666;fontSize=11;fontStyle=2;" vertex="1" parent="1">
+          <mxGeometry x="300" y="800" width="520" height="34" as="geometry" />
+        </mxCell>
+        <mxCell id="ep1" style="endArrow=none;html=1;dashed=1;strokeColor=#999999;" edge="1" parent="1" source="c1" target="perm"><mxGeometry relative="1" as="geometry" /></mxCell>
+        <mxCell id="ep2" style="endArrow=none;html=1;dashed=1;strokeColor=#999999;" edge="1" parent="1" source="c2" target="perm"><mxGeometry relative="1" as="geometry" /></mxCell>
+
+      </root>
+    </mxGraphModel>
+  </diagram>
+</mxfile>

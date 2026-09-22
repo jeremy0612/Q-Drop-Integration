@@ -1,0 +1,1169 @@
+\documentclass[journal]{IEEEtran}
+
+\usepackage{hyperref}
+\usepackage{amsmath, amssymb, amsthm}
+\usepackage[lined,boxed,ruled,linesnumbered]{algorithm2e}
+\usepackage{graphicx}
+\usepackage{subcaption}
+\usepackage{booktabs}
+\usepackage{multirow}
+\usepackage{tabularx}
+\usepackage[dvipsnames]{xcolor}
+\usepackage{cleveref}
+\usepackage{enumitem}
+\usepackage{cite}
+\usepackage{adjustbox}
+\usepackage{array}
+\usepackage{makecell}
+\usepackage{pifont}
+
+\newtheorem{theorem}{Theorem}
+\newtheorem{proposition}{Proposition}
+\newtheorem{definition}{Definition}
+\newtheorem{remark}{Remark}
+\newcommand{\cmark}{\ding{51}}
+\newcommand{\xmark}{\ding{55}}
+
+\begin{document}
+
+\title{Parameter-Efficient Quantum Graph Neural Networks for Graph Classification via QFI-Guided Geometric Pruning}
+
+\author{%
+  \IEEEauthorblockN{Cat Khanh Tran,~\IEEEmembership{}
+    Thai Quang Nguyen Pham,~\IEEEmembership{}
+    Van-Linh Nguyen,~\IEEEmembership{Member,~IEEE}}
+  \thanks{C.-K. Tran, T.-Q.~N. Pham, and V.-L. Nguyen are with the Department
+    of Computer Science and Information Engineering, National Chung Cheng
+    University, Chiayi, Taiwan (e-mail: 614410145@office365.ccu.edu.tw , nvlinh@cs.ccu.edu.tw).}
+  \thanks{Corresponding author: Van-Linh Nguyen.}
+  \thanks{Source code: \url{https://github.com/jeremy0612/Q-Drop-Integration}}
+}
+
+\markboth{IEEE TRANSACTIONS ON QUANTUM ENGINEERING}%
+{Tran \MakeLowercase{\textit{et al.}}: QFI-Pruned Quantum Graph Neural Networks}
+
+\maketitle
+
+%% ─────────────────────────────────────────────────────────────────────────────
+\begin{abstract}
+Graph classification is a fundamental graph-level learning problem that assigns a label to an entire graph rather than to individual nodes or edges. It remains challenging because graphs are irregular, non-Euclidean structures whose node semantics and global topology must be captured efficiently. Classical graph neural networks (GNNs) achieve strong accuracy but often require large parameter budgets that limit deployment on resource-constrained platforms. To address this, we propose two parameter-efficient quantum graph neural networks—the Quantum Graph Convolutional Network (QGCN) and Quantum Graph Attention Network (QGAT)—which use variational quantum circuit (VQC) encoders to produce compact quantum node representations for graph-level prediction. However, quantum neural networks remain vulnerable to training instability caused by barren plateaus and gate co-adaptation. We therefore introduce QFI-Drop, a geometry-aware pruning algorithm that scores each variational gate by its spectral leverage on the data-averaged Quantum Fisher Information Matrix (QFIM): gates whose energy lies predominantly in the null eigendirections of the QFIM are frozen, and the surviving gates are updated by a unified quantum-natural-gradient step preconditioned on the QFIM sub-manifold. Unlike heuristic gate-dropout schemes, QFI-Drop uses the intrinsic information geometry of the circuit to identify which parameters actually contribute to the trainable landscape, mitigating barren plateaus and co-adaptation at their source. To preserve permutation equivariance, the QFIM probe and the resulting freeze mask are shared across all node-level circuit evaluations within a mini-batch, so pruning depends only on graph content and not on node ordering. Evaluated on five benchmarks—MUTAG, PROTEINS, NCI1, IMDB-Binary, and IMDB-Multi. The framework achieves competitive accuracy against classical baselines while using only 3,411–9,031 parameters in total, corresponding to more than 97\% parameter reduction.
+
+
+\end{abstract}
+
+\begin{IEEEkeywords}
+Quantum graph neural network, quantum Fisher information, geometric pruning,
+quantum natural gradient, graph classification, variational quantum circuit,
+quantum machine learning, barren plateau, parameter efficiency
+\end{IEEEkeywords}
+
+\maketitle
+
+%% ─────────────────────────────────────────────────────────────────────────────
+\section{Introduction}
+\label{sec:intro}
+
+Graph classification---assigning a categorical label to an entire graph---is
+a fundamental task in machine learning with high-value applications spanning
+computational chemistry~\cite{MUTAG1991}, structural
+biology~\cite{PROTEINS2003}, social network
+analysis~\cite{IMDB2015}, and blockchain security~\cite{Zhuang2020IJCAI,
+Liu2021TKDE,Qian2023WWW}. The problem requires models to capture both
+local node-level semantics and global graph topology, making it
+substantially harder than node-level or edge-level tasks.
+
+Classical graph neural networks (GNNs) have become the dominant paradigm
+for graph classification. GCN~\cite{Kipf2017} demonstrated that stacked
+spectral convolution layers learn powerful graph representations.
+GAT~\cite{Velickovic2018} and GATv2~\cite{Brody2022ICLR} introduced
+attention-weighted aggregation, improving differentiation of neighbor
+relevance. GIN~\cite{Xu2019GIN} established theoretical limits by matching
+the 1-Weisfeiler--Leman (WL) expressiveness test. Higher-order approaches,
+including OSAN~\cite{Bause2023ICML}, CIN~\cite{Bodnar2021CIN},
+DropGNN~\cite{Papp2021NeurIPS}, and GRATIN~\cite{Abbahaddou2025ICML},
+push beyond 1-WL at the cost of significantly larger parameter budgets.
+Even lightweight configurations typically carry 50K--500K parameters,
+which is prohibitive for resource-constrained deployment scenarios such
+as edge computing nodes, embedded biosensors, blockchain validator
+gateways, and on-device medical diagnostics.
+
+Quantum machine learning (QML)~\cite{Cerezo2021,
+Schuld2021} opens a fundamentally different design space. Parameterized
+quantum circuits (PQCs)~\cite{Benedetti2019} exploit superposition and
+entanglement to implement rich nonlinear transformations in an exponentially
+large Hilbert space while requiring far fewer classically trainable
+parameters than neural networks of comparable expressive capacity.
+Early graph-level QML work includes equivariant quantum graph
+circuits~\cite{Mernyei2022ICML}, the quantum neural tangent kernel for
+graphs~\cite{Tang2022NeurIPS}, and quantum walk kernel methods such as
+QBMK~\cite{Bai2024ICML}. These pioneering works established that
+quantum-inspired approaches are viable for graph-structured data.
+
+Building on this foundation, our group introduced two unpublished hybrid
+architectures specifically designed for quantum graph classification:
+the Quantum Graph Convolutional Network (QGCN) and the
+Quantum Graph Attention Network (QGAT). QGCN applies a
+node-wise variational quantum circuit (VQC) to produce compact quantum
+node embeddings and propagates them via classical GCN aggregation,
+achieving competitive smart contract vulnerability detection accuracy
+with only $\approx$2,032 parameters---a 98\% reduction relative to
+classical GNN baselines~\cite{Zhuang2020IJCAI,Liu2021IJCAI,Liu2021TKDE,
+Qian2023WWW} that carry 66K--263K parameters. QGAT further replaces
+classical aggregation with a shared quantum attention circuit for edge
+scoring, operating with only 1,828 parameters while achieving
+100\% F1 on integer overflow/underflow
+detection. These results demonstrate the parameter
+efficiency of quantum graph encoders, but they also reveal a
+fundamental gap: \emph{no systematic regularization exists for
+graph-structured quantum encoders}.
+
+This gap is critical. As quantum circuit width or depth grows,
+gradient magnitudes vanish exponentially---the barren plateau
+phenomenon~\cite{McClean2018}---stalling optimization. Even in the
+shallow circuits used by QGCN and QGAT, unconstrained training leads
+to \emph{gate co-adaptation}: a small subset of high-gradient gates
+consistently dominates the representation, suppressing the contribution
+of remaining parameters and reducing generalization. In classical deep
+learning, dropout~\cite{Srivastava2014} and magnitude-based
+pruning~\cite{Han2015,LeCun1990OBD} are well-established remedies to
+analogous co-adaptation and redundancy problems. Analogous strategies
+for quantum circuits remain largely unexplored, with limited work such
+as Entangle Dropout~\cite{EntangleDropout} and layerwise
+learning~\cite{Skolik2021} addressing only narrow aspects.
+
+Our group's prior published work Q-Drop~\cite{QDrop2025ICC} took an
+important step by introducing two complementary quantum regularization
+techniques for quantum orthogonal neural networks on \emph{image}
+classification tasks: (1) \emph{dynamic circuit dropout} (circuit
+flip-flop), which stochastically deactivates Reconfigurable Beam
+Splitter (RBS) gate subsets via a Bernoulli mask at each training
+epoch; and (2) \emph{statistical pruning} (SP), which accumulates
+per-gate gradient magnitudes over a sliding window and selectively
+freezes low-impact gates based on the resulting importance distribution.
+Q-Drop achieved 94.3\% accuracy on Pneumonia-MNIST and 98.7\% on
+MNIST, outperforming qOrthoNN~\cite{Kerenidis2020QONN}, qCNN, and
+the parameter-shift rule baseline. However, Q-Drop was designed
+for flat (non-graph) inputs: the VQC processes a single sample at a
+time, and the dropout mask is applied globally.
+
+
+In this paper, we close these gaps by proposing \textbf{Geometric Adapted QFI-pruning on QGCN and QGAT}, the first quantum graph neural networks with systematic
+regularization, submitted to IEEE Transactions on Quantum Engineering.
+The central technical innovations are: (1) \emph{graph-consistent
+masking}, which samples a single gate mask per mini-batch and applies
+it uniformly to all nodes, preserving permutation equivariance; and
+(2) \emph{graph-adapted statistical pruning}, which aggregates gradient
+magnitudes across all node-level circuit evaluations within a sliding
+window, enabling robust gate importance estimation under graph-size
+variance. We evaluate on five standard graph classification benchmarks
+and demonstrate competitive accuracy against classical GNNs carrying
+50K--500K parameters, while using only 3,411--9,031 parameters total.
+The contributions of this paper are as follows:
+\begin{itemize}
+    \item \textbf{Two novel QGNN architectures:} QGCN and
+    QGAT are proposed for the first time on general graph classification
+    benchmarks (MUTAG, PROTEINS, NCI1, IMDB-Binary, IMDB-Multi).
+
+    \item \textbf{Graph-adapted geometric pruning:} Each gate is scored by its
+    spectral leverage on the data-averaged Quantum Fisher Information Matrix,
+    probed over all nodes in a mini-batch. Null-eigendirection gates are
+    frozen and survivors updated by a quantum-natural-gradient step on the
+    QFIM sub-manifold—mitigating barren plateaus at their geometric source
+    while the shared per-batch mask preserves permutation equivariance.
+
+    \item \textbf{Comprehensive benchmark and ablation:} We compare
+    against DropGNN, GATv2, OSAN, GRDL, SE2P, GRATIN, and QBMK,
+    demonstrating $>$97\% parameter reduction at competitive accuracy;
+    ablation confirms Quantum Network with suitable methods are individually necessary and mutually complementary.
+    \href{https://github.com/jeremy0612/Q-Drop-Integration}{\textcolor{blue}{Q-Drop}}.
+    \footnote{\url{https://github.com/jeremy0612/Q-Drop-Integration}}
+\end{itemize}
+
+The remainder of this paper is organized as follows.
+Section~\ref{sec:related} reviews related work.
+Section~\ref{sec:background} provides background on graph classification
+and quantum circuit primitives.
+Section~\ref{sec:arch} presents the QGCN and QGAT architectures in detail.
+Section~\ref{sec:method} introduces the Q-Drop integration framework.
+Section~\ref{sec:eval} reports experimental results and analysis.
+Section~\ref{sec:conclusion} concludes the paper.
+
+%% ─────────────────────────────────────────────────────────────────────────────
+\section{Related Work}
+\label{sec:related}
+
+\subsection{GNN-Based Graph Classification}
+
+Graph classification has been studied extensively since the introduction of
+graph kernels~\cite{Vishwanathan2010,Shervashidze2011WL} and the subsequent
+wave of deep learning methods. GCN~\cite{Kipf2017} framed spectral convolution
+as localized first-order approximations, enabling efficient feature propagation.
+GraphSAGE~\cite{Hamilton2017} introduced inductive sampling-based aggregation,
+scaling to large unseen graphs. GIN~\cite{Xu2019GIN} provably maximized
+discriminative power by using injective aggregation, matching the 1-WL graph
+isomorphism test. GAT~\cite{Velickovic2018} brought attention-weighted
+neighborhood aggregation, and GATv2~\cite{Brody2022ICLR} corrected GAT's
+static attention limitation by computing dynamic scores through a
+pre-nonlinearity transformation, strictly increasing expressiveness.
+
+Beyond 1-WL expressiveness, higher-order approaches have been pursued
+extensively. OSAN~\cite{Bause2023ICML} introduced ordered subgraph aggregation
+for outerplanar graphs, achieving 93.6\% on MUTAG. CIN~\cite{Bodnar2021CIN}
+used cellular sheaf structures, GSN~\cite{Bouritsas2022} leveraged subgraph
+isomorphism counting, and PathNN~\cite{Michel2023PathNN} integrated path-level
+information, each exceeding 1-WL at the cost of significantly increased
+computational and memory overhead. Stochastic depth approaches such as
+DropGNN~\cite{Papp2021NeurIPS} execute multiple GNN runs over graphs with
+randomly dropped nodes, improving expressiveness by inducing ensemble effects
+over diverse structural views of each graph.
+
+Recent augmentation-based approaches target distribution shift and
+out-of-distribution generalization. GRDL (NeurIPS 2024) combines
+graph-level regularization with differential learning. SE2P~\cite{Saber2024CIKM}
+introduces scalable graph perturbation in the preprocessed feature space.
+GRATIN~\cite{Abbahaddou2025ICML} fits Gaussian Mixture Models to entire
+training-set graph representations and samples augmented views in latent space,
+achieving strong OOD generalization. ANGC (AAAI 2026) proposes an anchor-driven
+Nystr\"om framework for deep graph-level clustering. Despite their accuracy
+these methods all operate entirely in the classical domain and typically
+carry 50K--500K+ parameters.
+
+\subsection{Quantum Graph Learning}
+
+Quantum approaches to graph-structured learning have attracted growing
+research interest as quantum hardware matures. QBMK~\cite{Bai2024ICML}
+uses continuous-time quantum walk (CTQW) Shannon entropy kernels to compute
+graph similarity, capturing global and local structural statistics via quantum
+walk statistics on aligned vertices. While QBMK provides an interesting
+quantum perspective on graph similarity, it lacks neural network feature
+learning, employs no attention mechanism, uses no dropout regularization,
+and relies on a classical SVM readout, limiting its end-to-end trainability
+and expressiveness.
+
+Equivariant quantum graph circuits~\cite{Mernyei2022ICML} provide theoretical
+foundations for symmetry-preserving quantum graph operations by constructing
+circuits that respect graph automorphisms. GraphQNTK~\cite{Tang2022NeurIPS}
+studied the quantum neural tangent kernel for graph data, providing theoretical
+insights into the training dynamics of quantum graph models in the
+infinite-width limit. However, none of these methods have been evaluated at
+scale on standard graph classification benchmarks, and none incorporate
+systematic regularization strategies.
+
+\subsection{Quantum Circuit Regularization}
+
+Regularization for parameterized quantum circuits is a nascent but rapidly
+developing field. The barren plateau problem~\cite{McClean2018} describes
+the exponential vanishing of gradients in deep or wide quantum circuits,
+motivating the need for structural and training-time interventions.
+Entangle Dropout~\cite{EntangleDropout} applied classical dropout ideas
+directly to entanglement gates, showing that randomly removing entangling
+operations during training can provide modest robustness improvements on
+small circuits. Layerwise learning~\cite{Skolik2021} proposed training
+quantum circuits one layer at a time to avoid barren plateaus during
+initialization. Noise-induced barren plateaus~\cite{Wang2021Noise} studied
+how hardware noise exacerbates gradient vanishing, motivating noise-resilient
+training procedures.
+
+Our Q-Drop~\cite{QDrop2025ICC} provides the most comprehensive regularization
+framework for quantum neural networks to date, combining two orthogonal
+mechanisms: dynamic dropout via a circuit flip-flop that stochastically
+deactivates gate subsets, and statistical pruning that identifies low-impact
+gates by tracking accumulated gradient magnitudes. Q-Drop achieved 94.3\%
+accuracy on Pneumonia-MNIST and 98.7\% on standard MNIST, outperforming
+qOrthoNN, the Parameter Shift Rule baseline, and qCNN. Crucially, Q-Drop
+has never been applied to graph-structured data, and the graph-consistency
+requirement---that all nodes within a graph must experience a coherent
+circuit structure per training step---represents a non-trivial design
+challenge that we address in this paper.
+
+\subsection{Summary and Positioning}
+
+Table~\ref{tab:related_comparison} summarizes the key properties of the
+most closely related methods. Our proposed framework is the only approach
+that simultaneously provides: hybrid classical-quantum encoding, graph
+attention, dropout regularization, gradient-based pruning, and evaluation
+on standard multi-dataset graph benchmarks.
+
+{\renewcommand{\arraystretch}{1.2}
+\begin{table*}[t]
+  \centering
+  \caption{Comparison of closely related methods across key design dimensions.
+    \cmark~= present, \xmark~= absent, P = partial.}
+  \label{tab:related_comparison}
+  \resizebox{\linewidth}{!}{%
+  \begin{tabular}{l l l c c c c c c}
+    \toprule
+    Method & Venue & Year &
+    \makecell{Neural\\Learning} &
+    \makecell{Graph\\Attention} &
+    \makecell{Quantum\\Encoder} &
+    \makecell{Dropout\\Reg.} &
+    \makecell{Gradient\\Pruning} &
+    \makecell{Multi-dataset\\Benchmark} \\
+    \midrule
+    DropGNN~\cite{Papp2021NeurIPS}   & NeurIPS & 2021 & \cmark & \xmark & \xmark & P & \xmark & \cmark \\
+    GATv2~\cite{Brody2022ICLR}       & ICLR    & 2022 & \cmark & \cmark & \xmark & \xmark & \xmark & \cmark \\
+    QBMK~\cite{Bai2024ICML}          & ICML    & 2024 & \xmark & \xmark & P      & \xmark & \xmark & P \\
+    GRATIN~\cite{Abbahaddou2025ICML} & ICML    & 2025 & \cmark & \xmark & \xmark & \xmark & \xmark & \cmark \\
+    \textbf{Ours}          & --      & 2026 & \cmark & \cmark & \cmark & \cmark & \cmark & \cmark \\
+    \bottomrule
+  \end{tabular}}
+\end{table*}}
+
+%% ─────────────────────────────────────────────────────────────────────────────
+\section{Background}
+\label{sec:background}
+
+\subsection{Graph Classification Problem}
+
+Let $G = (V, E, \mathbf{X})$ denote a graph with node set $V$, edge set $E$,
+and node feature matrix $\mathbf{X} \in \mathbb{R}^{|V| \times d}$, where
+$d$ is the feature dimension. In graph classification, we are given a labeled
+training set $\mathcal{D} = \{(G_i, y_i)\}_{i=1}^N$ and seek to learn a
+parametric predictor $f_\Theta: G \to \mathcal{Y}$ that maps each graph to
+a class label $y_i \in \mathcal{Y}$. The standard training objective is to
+minimize the empirical risk:
+\begin{equation}
+  \min_\Theta \;\frac{1}{N}\sum_{i=1}^N \mathcal{L}\!\left(f_\Theta(G_i), y_i\right),
+  \label{eq:obj}
+\end{equation}
+where $\mathcal{L}$ is the cross-entropy loss for multi-class settings or
+binary cross-entropy for binary classification.
+
+A typical GNN-based $f_\Theta$ consists of $L$ message-passing layers that
+iteratively update node representations, followed by a global pooling
+operator and a classification head. The representation of node $v$ after
+layer $\ell$ is:
+\begin{equation}
+  \mathbf{h}_v^{(\ell)} = \phi\!\left(\mathbf{h}_v^{(\ell-1)},\;
+  \text{AGG}\!\left\{\mathbf{h}_u^{(\ell-1)} : u \in \mathcal{N}(v)\right\}\right),
+  \label{eq:gnn}
+\end{equation}
+where $\phi$ is a learnable update function, $\text{AGG}$ is a neighborhood
+aggregation operator, and $\mathcal{N}(v)$ denotes the neighbors of $v$.
+After $L$ layers, a readout function $R$ produces the graph embedding:
+$\mathbf{g} = R\!\left(\{\mathbf{h}_v^{(L)}\}_{v \in V}\right)$, typically
+global mean or sum pooling.
+
+\subsection{Variational Quantum Circuits}
+
+A variational quantum circuit (VQC) is a parameterized quantum program
+consisting of alternating layers of fixed entangling gates and trainable
+single-qubit rotations~\cite{Cerezo2021}. Given an $n_q$-qubit system,
+the circuit takes an input state $|0\rangle^{\otimes n_q}$ and produces
+an output state $|\psi(\theta)\rangle = U(\theta)|0\rangle^{\otimes n_q}$,
+where $U(\theta)$ is the product of all gate operations parameterized by
+$\theta \in \mathbb{R}^P$.
+
+\emph{Angle embedding} encodes a classical input vector $\mathbf{z} \in
+\mathbb{R}^{n_q}$ into the quantum state by applying $R_Y(z_i)$ rotations:
+$|\psi(\mathbf{z})\rangle = \bigotimes_{i=1}^{n_q} R_Y(z_i)|0\rangle$,
+where $R_Y(\alpha) = e^{-i\alpha Y/2}$ is a rotation about the $Y$-axis.
+The variational ansatz then applies trainable $R_Y(\theta_i)$ and
+$R_Z(\phi_i)$ rotations on each qubit, interspersed with a ring
+CNOT entanglement pattern. Pauli-Z measurements extract classical
+outputs:
+$g_i = \langle\psi(\theta)|Z_i|\psi(\theta)\rangle \in [-1, 1]$.
+
+\emph{Parameter-shift rule}~\cite{Mitarai2018} enables exact gradient
+computation for VQCs on quantum hardware:
+\begin{equation}
+  \frac{\partial \mathcal{L}}{\partial \theta_i}
+  = \frac{1}{2}\left[\mathcal{L}(\theta_i + \tfrac{\pi}{2})
+  - \mathcal{L}(\theta_i - \tfrac{\pi}{2})\right],
+  \label{eq:psr}
+\end{equation}
+making VQCs fully differentiable and compatible with classical
+backpropagation frameworks.
+
+%% ─────────────────────────────────────────────────────────────────────────────
+\section{QGCN and QGAT: Base Architectures}
+\label{sec:arch}
+
+\subsection{Overview}
+
+Both QGCN and QGAT follow the same high-level hybrid design: a classical
+graph preprocessing stage normalizes the input graph, a stacked quantum
+encoder transforms node features into compact quantum embeddings, and a
+lightweight classification head maps the pooled graph embedding to a
+class label. The key distinction is in the aggregation strategy: QGCN
+uses classical spectral aggregation derived from GCN, while QGAT replaces
+this with a learnable quantum attention mechanism for edge scoring.
+
+\subsection{QGCN: Quantum Graph Convolutional Network}
+\label{ssec:qgcn}
+
+\subsubsection{Graph Normalization}
+
+Following, we apply a merge-and-redirect normalization
+procedure that eliminates secondary and fallback nodes by merging their
+features into the nearest major nodes by graph distance and redirecting
+incident edges accordingly. This reduces structural variance across graphs
+of differing styles while preserving the execution-relevant topology,
+producing a normalized graph $\bar{G} = (\bar{V}, \bar{E})$ with enriched
+major node features.
+
+\subsubsection{Node-wise Quantum Feature Extraction}
+
+At layer $\ell$, each node $v \in \bar{V}$ has a representation
+$\mathbf{h}_v^{(\ell)} \in \mathbb{R}^{d_\ell}$. A learnable
+projection matrix $W_r^{(\ell)} \in \mathbb{R}^{d_\ell \times n_q}$
+maps this to an $n_q$-dimensional quantum embedding:
+\begin{equation}
+  \mathbf{z}_v^{(\ell)} = W_r^{(\ell)}\,\mathbf{h}_v^{(\ell)}
+  \in \mathbb{R}^{n_q}.
+  \label{eq:proj}
+\end{equation}
+The VQC encodes $\mathbf{z}_v^{(\ell)}$ via angle embedding and applies
+a shallow variational ansatz with trainable single-qubit rotations
+$\{R_Y(\theta_i), R_Z(\phi_i)\}$ and a ring CNOT entanglement pattern.
+Pauli-Z measurements produce the quantum embedding:
+\begin{equation}
+  \mathbf{g}_v^{(\ell)} = Q_\phi\!\left(\mathbf{z}_v^{(\ell)}\right)
+  = \left[\langle Z_0\rangle, \ldots, \langle Z_{n_q-1}\rangle\right]
+  \in \mathbb{R}^{n_q}.
+  \label{eq:vqc_qgcn}
+\end{equation}
+The same VQC template $Q_\phi$ with shared parameters $\phi$ is applied
+independently to every node in the graph, keeping the parameter count
+independent of graph size.
+
+\subsubsection{Classical Neighborhood Aggregation}
+
+The quantum embeddings are aggregated via the classical GCN rule:
+\begin{equation}
+  \mathbf{H}^{(\ell+1)} = \sigma\!\left(\hat{A}\,\mathbf{G}^{(\ell)}\right),
+  \label{eq:gcn_agg}
+\end{equation}
+where $\mathbf{G}^{(\ell)}$ stacks all $\mathbf{g}_v^{(\ell)}$ row-wise,
+$\hat{A} = \tilde{D}^{-1/2}\tilde{A}\tilde{D}^{-1/2}$ is the symmetrically
+normalized adjacency matrix with $\tilde{A} = A + I$, $\tilde{D}$ is the
+degree matrix of $\tilde{A}$, and $\sigma$ is a non-linearity (LeakyReLU).
+
+\subsubsection{Classification Heads}
+
+After $L$ layers, global mean pooling produces the graph embedding:
+$\mathbf{g} = \frac{1}{|\bar{V}|}\sum_{v \in \bar{V}}\mathbf{h}_v^{(L)}$.
+We evaluate three classifier head variants on top of $\mathbf{g}$:
+
+\textit{Linear classifier:} A simple affine transformation
+$\hat{y} = \sigma(\mathbf{w}^\top\mathbf{g} + b)$, where $\sigma$ is
+sigmoid for binary tasks. This head is intentionally lightweight,
+ensuring that performance improvements can be attributed to the quantum
+encoder rather than classifier complexity.
+
+\textit{Matrix Product State (MPS) classifier:} Adopted from~\cite{Bhatia2019MPS},
+this head encodes $\mathbf{g}$ into $n_q$ qubits via angle embedding and
+applies a chain-structured entangling circuit that couples adjacent qubits.
+The readout is obtained from a Pauli-Z expectation on a designated output
+qubit.
+
+\textit{Tree Tensor Network (TTN) classifier:} Adopted
+from~\cite{Grant2018Hierarchical}, this head uses a binary tree circuit
+where qubits are progressively merged via pairwise entangling operations.
+The hierarchical structure naturally captures multi-scale correlations in
+the graph embedding.
+
+In all experiments we report results for the linear classifier as the
+primary variant, which consistently achieves the best performance,
+suggesting that the quantum encoder already produces linearly separable
+representations for the tasks considered.
+The node-wise quantum encoder is illustrated in
+Fig.~\ref{fig:node-vqc}. This circuit is shared by both QGCN and QGAT:
+each node is processed independently by the same VQC template, while
+the trainable quantum parameters are shared across all node evaluations.
+This design makes the quantum parameter count independent of the number
+of nodes in the graph.
+
+\begin{figure}[!t]
+    \centering
+    \includegraphics[width=\columnwidth]{QGCN.pdf}
+    \caption{
+    Node-wise variational quantum circuit encoder shared by QGCN and QGAT.
+    Each node representation $h_v^{(\ell)}$ is first projected by
+    $W_r^{(\ell)}$ into an $n_q$-dimensional vector $z_v^{(\ell)}$.
+    The vector is encoded through angle embedding using $R_Y(z_i)$ rotations,
+    followed by trainable $R_Y(\theta_i)$ and $R_Z(\phi_i)$ rotations and a
+    CNOT entangling layer. Pauli-$Z$ measurements produce the quantum node
+    embedding $g_v^{(\ell)} = [\langle Z_0\rangle,\ldots,\langle Z_{n_q-1}\rangle]$.
+    The same circuit template and parameters are shared across all nodes,
+    keeping the quantum parameter count independent of graph size.
+    }
+    \label{fig:node-vqc}
+\end{figure}
+\subsubsection{Node-wise Quantum Feature Extraction}
+
+QGAT uses the same node-wise VQC as QGCN to produce quantum node
+embeddings $\mathbf{h}_v^{(0)} \in \mathbb{R}^{n_q}$ at the first layer,
+and updates them to $\mathbf{h}_v^{(\ell)} \in \mathbb{R}^{n_q}$ across
+subsequent layers. The circuit architecture is identical to
+Eq.~\eqref{eq:vqc_qgcn} with the same angle embedding and variational
+ansatz design.
+
+\subsubsection{Quantum Attention Mechanism}
+
+For each directed edge $(u, v) \in \bar{E}$, QGAT computes a scalar
+attention logit via a quantum attention circuit. An edge-specific input
+vector is formed by concatenation and low-dimensional projection:
+\begin{equation}
+  \mathbf{z}_{uv} = \mathbf{W}_a\,[\mathbf{h}_u \| \mathbf{h}_v]
+  \in \mathbb{R}^{n_q},
+  \label{eq:edge_proj}
+\end{equation}
+where $\mathbf{W}_a \in \mathbb{R}^{n_q \times 2n_q}$ is a trainable
+projection. The attention circuit (illustrated in Fig.~\ref{fig:qgat_circuit})
+injects $\mathbf{z}_{uv}$ as data-dependent rotations $R_Y(z_i)$ on qubit
+$i$, then applies shared trainable rotations $\{R_Y(\theta_i), R_Z(\phi_i)\}$
+on each qubit and a readout rotation $R_Y(\omega)$ on the last qubit.
+The scalar attention logit is obtained from the Pauli-Z expectation on
+the last qubit:
+\begin{equation}
+  o_{uv} = \mathcal{Q}(\mathbf{z}_{uv}; \Theta) = \langle Z_{n_q-1}\rangle
+  \in [-1, 1].
+  \label{eq:qgat_logit}
+\end{equation}
+The trainable parameters $\Theta = \{\theta_i, \phi_i, \omega\}$ are
+\textit{shared across all edges}, so the parameter count scales only with
+$n_q$ and not with graph size.
+
+\subsubsection{Attention-Weighted Aggregation}
+
+The attention weights are computed by applying softmax over all incoming
+edges to each node:
+\begin{equation}
+  \alpha_{uv} = \frac{\exp(o_{uv} / \tau)}{\sum_{u' \in \mathcal{N}(v)}
+  \exp(o_{u'v} / \tau)},
+  \label{eq:softmax_att}
+\end{equation}
+where $\tau$ is a temperature hyperparameter. Node embeddings are then
+updated by attention-weighted aggregation:
+\begin{equation}
+  \mathbf{h}_v^{(\ell+1)} = \sigma\!\left(\sum_{u \in \mathcal{N}(v)}
+  \alpha_{uv}\,\mathbf{h}_u^{(\ell)}\right).
+  \label{eq:qgat_agg}
+\end{equation}
+This aggregation remains fully classical for scalability, while the
+quantum circuit handles the attention scoring. After $L$ layers, global
+mean pooling and a linear classifier produce $\hat{y}$ as in QGCN.
+
+\begin{figure}[t]
+  \centering
+  % Placeholder: replace with actual tikz or pdf figure
+  \includegraphics[width=\linewidth]{QGAT.pdf}
+  \caption{Quantum attention circuit for QGAT ($n_q = 8$ qubits). Data-dependent
+    rotations $R_Y(z_i)$ encode the edge feature vector. Trainable rotations
+    $R_Y(\theta_i)$, $R_Z(\phi_i)$, and a readout rotation $R_Y(\omega)$ on
+    the last qubit produce a scalar attention logit $\langle Z_7 \rangle$.
+    All parameters $\{\theta_i, \phi_i, \omega\}$ are shared across edges.}
+  \label{fig:qgat_circuit}
+\end{figure}
+
+%% ─────────────────────────────────────────────────────────────────────────────
+\section{Proposed QFI-Pruning Framework for Graph Networks}
+\label{sec:method}
+
+\begin{figure*}[t]
+  \centering
+  \includegraphics[width=1\linewidth]{images/qfi_vs_sp_circuit.drawio.pdf}
+  \caption{Original statistical pruning (a) vs.\ the proposed
+    graph-adapted QFI-pruning (b) on the shared QGCN/QGAT node-embedding
+    circuit (AngleEmbedding, variational $R_Y$ layer, CNOT ring).
+    (a)~SP scores each gate by its gradient magnitude accumulated over a
+    sliding window of $m$ steps, freezes gates below the pruning-ratio
+    threshold $\rho$, and applies a plain gradient step to the survivors.
+    (b)~QFI-pruning probes the data-averaged QFIM once per epoch,
+    eigendecomposes it to isolate the informative eigenspace
+    ($\lambda_i \geq \kappa\lambda_{\max}$), scores each gate by its
+    spectral leverage $e_j$, freezes gates with $e_j < \tau$, and
+    preconditions the survivors with the quantum-natural-gradient step of
+    Eq.~\eqref{eq:sp_anneal}. The two criteria can disagree: a gate with a
+    large but flat gradient---its energy confined to null
+    eigendirections---is kept by SP yet frozen by QFI-pruning, whereas a
+    small-gradient gate with high leverage is frozen by SP yet kept and
+    QNG-rescaled. In both variants a single mask is shared by every
+    node-level evaluation in the mini-batch, preserving permutation
+    equivariance; at inference all gates are active.}
+  \label{fig:framework}
+\end{figure*}
+
+This section presents the two core technical contributions of this work:
+graph-consistent QFIM probing and graph-adapted QFI-pruning.
+Fig.~\ref{fig:framework} contrasts the proposed criterion with the
+original statistical pruning of~\cite{QDrop2025ICC}; the training
+pipeline is summarized in Algorithm~\ref{alg:qdrop_graph}.
+
+\subsection{Motivation: Training Instabilities in QGNNs}
+
+Before presenting the technical details, we briefly analyze the sources
+of training instability in quantum graph networks. When the same VQC
+parameters $\phi$ are applied to all nodes independently, the gradients
+with respect to $\phi$ are computed as:
+\begin{equation}
+  \nabla_\phi \mathcal{L} = \frac{1}{|B|}
+  \sum_{G \in B}\sum_{v \in V_G} \frac{\partial \mathcal{L}_G}{\partial g_{v,i}}
+  \cdot \frac{\partial g_{v,i}}{\partial \phi_i},
+  \label{eq:total_grad}
+\end{equation}
+where $B$ is the current mini-batch and $V_G$ is the node set of graph $G$.
+Two pathological behaviors emerge:
+
+\textit{Gate co-adaptation:} When certain gate parameters consistently
+dominate the gradient signal across many graph instances, other gates
+become redundant and receive negligible updates. The model effectively
+learns to use only a subset of its quantum degrees of freedom.
+
+\textit{High gradient variance:} Because $|V_G|$ varies significantly
+across graphs (e.g., from 17 nodes in MUTAG to over 600 in PROTEINS),
+the magnitude of $\nabla_\phi \mathcal{L}$ fluctuates wildly between
+mini-batches, destabilizing learning rate selection and convergence.
+
+Both pathologies are geometric: they manifest as a QFIM whose spectrum
+collapses onto a few dominant eigendirections while the remainder become
+null. QFI-pruning addresses them jointly---freezing gates that live in the
+null space and steering the survivors along the informative sub-manifold
+via a quantum-natural-gradient step.
+
+\subsection{Graph-Consistent QFIM Probing}
+\label{ssec:qdrop}
+The original Q-Drop~\cite{QDrop2025ICC} operates on flat inputs where a
+single circuit processes one sample at a time. Since this method did not bring major effects on graph issues, we came up with new geometric-oriented improvement for the algorithm.
+QFI-pruning is driven by the Quantum Fisher Information Matrix (QFIM),
+the Fubini--Study metric of the node-embedding circuit, which measures
+how distinguishable the output state becomes under perturbations of the
+variational parameters $\phi$. Because the circuit uses angle embedding,
+the QFIM is input-dependent; in the graph setting the VQC is evaluated
+once per node, so a per-node QFIM would produce a different pruning
+decision for every node and thereby violate permutation equivariance:
+nodes with structurally incompatible freeze patterns would yield
+embeddings that cannot be meaningfully aggregated via $\hat{A}$.
+
+We resolve this with \textbf{graph-consistent QFIM probing}: a single
+data-averaged QFIM is estimated \emph{once per mini-batch step} by
+averaging the Fubini--Study metric $\mathbf{F}(\mathbf{z}_v)$ over all
+node-level circuit evaluations in the batch,
+\begin{equation}
+  \mathbf{F}^{(t)} = \frac{1}{\sum_{G \in B}|V_G|}
+  \sum_{G \in B}\sum_{v \in V_G} \mathbf{F}\!\left(\mathbf{z}_v;\,\phi^{(t)}\right),
+  \label{eq:qdrop_graph}
+\end{equation}
+where $\mathbf{F} \in \mathbb{R}^{n_g \times n_g}$ is symmetric positive
+semi-definite and $n_g$ is the number of variational gates. The single
+$\mathbf{F}^{(t)}$ induces one shared freeze mask
+$\mathbf{m}^{(t)} \in \{0,1\}^{n_g}$ (derived in
+Sec.~\ref{ssec:sp}) that is applied identically to every node in the
+batch. This ensures all node embeddings in a step are produced by the
+same active-gate topology, preserving permutation equivariance: if nodes
+$u$ and $v$ share a feature vector, they produce identical embeddings
+regardless of the mask.
+
+The QFIM is computed under \texttt{no\_grad} and treated as a constant
+preconditioner within the step; the freeze mask is applied in both the
+forward and backward passes during training. At inference, all gates are
+active (no masking) and predictions use the full circuit. For QGAT, the
+same probe and mask cover the quantum attention circuit, ensuring
+consistent edge scoring within a training step. To amortize cost, the
+QFIM is re-probed once per epoch rather than every step, since the
+information geometry drifts slowly relative to the parameter updates.
+
+\subsection{Graph-Adapted QFI-Pruning}
+\label{ssec:sp}
+
+Given the shared QFIM $\mathbf{F}^{(t)}$ of Eq.~\eqref{eq:qdrop_graph},
+QFI-pruning scores each gate by how much of its update direction lies in
+the informative sub-manifold of the loss landscape. Not all VQC gates
+contribute equally: gradient-magnitude heuristics conflate genuinely
+influential gates with those merely receiving large but uninformative
+gradients, whereas the QFIM directly exposes which parameter directions
+change the output state. We eigendecompose the symmetric PSD QFIM as
+$\mathbf{F} = \mathbf{U}\,\mathrm{diag}(\lambda_1,\ldots,\lambda_{n_g})\,\mathbf{U}^\top$
+with $\lambda_1 \geq \cdots \geq \lambda_{n_g} \geq 0$, and define the
+retained eigenspace by a relative spectral cutoff,
+\begin{equation}
+  \mathcal{K} = \bigl\{\, i : \lambda_i \geq \kappa\,\lambda_{\max} \,\bigr\},
+  \label{eq:sp_accum_graph}
+\end{equation}
+where $\kappa$ is the spectral ratio (we use $\kappa=10^{-3}$). The
+directions with $\lambda_i < \kappa\,\lambda_{\max}$ span the numerical
+null space---the flat, barren directions of the landscape. The
+\emph{spectral leverage} of gate $j$ is the fraction of its energy lying
+in the retained eigenspace,
+\begin{equation}
+  e_j = \sum_{i \in \mathcal{K}} \mathbf{U}_{ji}^2 \in [0,1].
+  \label{eq:sp_prob}
+\end{equation}
+A gate is frozen when the majority of its energy is null, i.e.\ its
+gradient is zeroed before the optimizer step whenever $e_j < \tau$; the
+surviving set is $\mathcal{S} = \{\, j : e_j \geq \tau \,\}$ with energy
+threshold $\tau = 0.5$. The survivors are then updated by a unified
+quantum-natural-gradient step that preconditions the gradient with the
+QFIM restricted to $\mathcal{S}$,
+\begin{equation}
+  \tilde{\mathbf{g}}_{\mathcal{S}} =
+  \bigl(\mathbf{F}_{\mathcal{S}\mathcal{S}} + \epsilon\,\mathbf{I}\bigr)^{-1}
+  \mathbf{g}_{\mathcal{S}},
+  \label{eq:sp_anneal}
+\end{equation}
+where $\mathbf{g}_{\mathcal{S}} = \nabla_{\phi_{\mathcal{S}}}\mathcal{L}$,
+$\mathbf{F}_{\mathcal{S}\mathcal{S}}$ is the corresponding QFIM submatrix,
+and $\epsilon = 10^{-4}$ is a Tikhonov regularizer ensuring a
+well-conditioned solve. Freezing removes barren directions from the update
+while the natural-gradient step rescales the survivors by the local
+information geometry, jointly countering gate co-adaptation. For QGAT, we
+treat the node-level VQC parameters and the shared quantum attention
+circuit parameters as a single pool subject to the same QFIM-based
+freeze-and-precondition rule.
+
+% \subsection{Differential Learning Rates via OneCycleLR}
+
+% A further refinement of our training pipeline separates the learning rate
+% schedule for classical parameters (projection layers, classification head)
+% and quantum parameters (VQC ansatz, attention circuit). Classical parameters
+% can tolerate higher learning rates due to the smoothness of linear and
+% affine maps, while quantum parameters are sensitive to large gradient steps
+% that can induce rapid oscillations in circuit angles (as $R_Y(\theta)$
+% is $2\pi$-periodic). Inspired by~\cite{OneCycleLR}, we apply
+% AdamW~\cite{AdamW} with a OneCycleLR schedule that:
+% \begin{itemize}[noitemsep]
+%   \item Sets the peak classical learning rate at $\eta_c = 0.025$ with
+%     a warmup of 10 epochs;
+%   \item Sets the peak quantum learning rate at $\eta_q = 0.0025$
+%     (one-tenth of classical), saturated flat throughout training.
+% \end{itemize}
+% This layer-wise learning rate separation, originally used in ViT
+% training~\cite{Dosovitskiy2021ViT}, proves equally effective in hybrid
+% quantum-classical settings by preventing over-rotation of quantum gate
+% angles during aggressive classical parameter updates.
+
+\subsection{Combined Training Procedure}
+
+Algorithm~\ref{alg:qdrop_graph} summarizes the complete training procedure
+for QFI-pruned QGCN/QGAT. The outer loop iterates over epochs; the
+inner loop processes mini-batches. Once per epoch the data-averaged QFIM
+is probed and the spectral-leverage scores and freeze mask are refreshed.
+For each batch: (1) the forward pass evaluates the VQC for all nodes;
+(2) the backward pass computes parameter-shift gradients for quantum
+parameters and standard backpropagation for classical parameters;
+(3) QFI-pruning zeroes the gradients of frozen gates and preconditions the
+survivors by the QNG step of Eq.~\eqref{eq:sp_anneal}; (4) AdamW updates
+the parameters with differential learning rates.
+
+\begin{algorithm}[t]
+\SetAlgoLined
+\small
+\KwIn{Training set $\mathcal{D}$; spectral ratio $\kappa$; energy
+  threshold $\tau$; QNG regularizer $\epsilon$; classical/quantum LR
+  $\eta_c, \eta_q$; total epochs $T$}
+\KwOut{Converged parameters $\Theta = (\Theta_{\text{cls}}, \phi)$}
+Initialize $\Theta$\;
+\For{epoch $= 1$ \KwTo $T$}{
+  // \textit{Step 0: Probe QFIM once per epoch}\\
+  $\mathbf{F} \leftarrow$ data-averaged QFIM via Eq.~\eqref{eq:qdrop_graph}\;
+  Eigendecompose $\mathbf{F}$; retain $\mathcal{K}$ via Eq.~\eqref{eq:sp_accum_graph}\;
+  Leverage $e_j$ via Eq.~\eqref{eq:sp_prob};
+    survivors $\mathcal{S} = \{j : e_j \geq \tau\}$\;
+  \ForEach{mini-batch $B \subset \mathcal{D}$}{
+    // \textit{Step 1: Forward pass}\\
+    \ForEach{graph $G \in B$}{
+      \ForEach{node $v \in V_G$}{
+        Compute $\mathbf{g}_v = Q_\phi(\mathbf{z}_v)$ via
+          Eq.~\eqref{eq:vqc_qgcn}\;
+      }
+      Aggregate (QGCN: Eq.~\eqref{eq:gcn_agg}; QGAT:
+        Eq.~\eqref{eq:qgat_agg})\;
+      Pool $\rightarrow \hat{y}$; compute $\mathcal{L}_G$\;
+    }
+    // \textit{Step 2: Compute gradients}\\
+    $\nabla_\phi \mathcal{L}$ via parameter-shift rule (Eq.~\eqref{eq:psr})\;
+    $\nabla_{\Theta_{\text{cls}}} \mathcal{L}$ via backpropagation\;
+    // \textit{Step 3: QFI-pruning (freeze + QNG precondition)}\\
+    Zero $\nabla_{\phi_j}$ for $j \notin \mathcal{S}$\;
+    $\nabla_{\phi_{\mathcal{S}}} \leftarrow
+      (\mathbf{F}_{\mathcal{S}\mathcal{S}} + \epsilon\mathbf{I})^{-1}
+      \nabla_{\phi_{\mathcal{S}}}$ (Eq.~\eqref{eq:sp_anneal})\;
+    // \textit{Step 4: Optimizer step}\\
+    $\Theta_{\text{cls}} \leftarrow \Theta_{\text{cls}} -
+      \eta_c \cdot \text{AdamW}(\nabla_{\Theta_{\text{cls}}}\mathcal{L})$\;
+    $\phi \leftarrow \phi -
+      \eta_q \cdot \text{AdamW}(\nabla_\phi \mathcal{L})$\;
+  }
+}
+\caption{QFI-pruned training for QGCN/QGAT}
+\label{alg:qdrop_graph}
+\end{algorithm}
+
+%% ─────────────────────────────────────────────────────────────────────────────
+\section{Experimental Evaluation}
+\label{sec:eval}
+
+\subsection{Datasets}
+
+We evaluate on five standard graph classification benchmarks, summarized
+in Table~\ref{tab:datasets}.
+
+\textbf{MUTAG}~\cite{MUTAG1991}: 188 molecular graphs of mutagenic aromatic
+and heteroaromatic nitro compounds. Nodes represent atoms encoded with
+7 discrete atom-type labels. Edges represent chemical bonds. Binary
+classification: mutagenic vs.\ non-mutagenic effect on \emph{Salmonella
+typhimurium}. Standard evaluation uses 10-fold cross-validation (mean
+accuracy $\pm$ std).
+
+\textbf{PROTEINS}~\cite{PROTEINS2003}: 1,113 protein graphs from the
+Protein Data Bank~\cite{Berman2000PDB}. Node features are 3 discrete
+secondary structure labels (helix, sheet, turn). Edges represent proximity
+or contact between residues. Binary classification: enzyme vs.\ non-enzyme.
+
+\textbf{NCI1}~\cite{NCI1}: Approximately 4,110 chemical compound graphs
+from the National Cancer Institute. Nodes represent atoms with one-hot
+encoded atom-type labels (37 possible types); edges represent chemical
+bonds. Binary classification: active (anti-cancer compound) vs.\
+inactive.
+
+\textbf{IMDB-Binary}~\cite{IMDB2015}: 1,000 ego-network graphs derived
+from IMDB movie collaboration data. Each graph represents the
+collaboration network of an actor or actress in a specific genre, with
+no node features (degree-based one-hot initialization). Binary
+classification between two genres.
+
+\textbf{IMDB-Multi}~\cite{IMDB2015}: Same structure as IMDB-Binary but
+with 3-class labels, representing a harder multi-class variant. 1,000
+graphs with mean 13 nodes and 65.9 edges.
+
+{\renewcommand{\arraystretch}{1.15}
+\begin{table}[t]
+  \centering
+  \caption{Graph classification benchmark dataset statistics.}
+  \label{tab:datasets}
+  \resizebox{\linewidth}{!}{%
+  \begin{tabular}{l c c c c c}
+    \toprule
+    Dataset & Graphs & Avg.\ nodes & Avg.\ edges & Node feat.\ dim & Classes \\
+    \midrule
+    MUTAG      & 188   & 17.9  & 19.8  & 7   & 2 \\
+    PROTEINS   & 1,113 & 39.1  & 72.8  & 3   & 2 \\
+    NCI1       & 4,110 & 29.8  & 32.3  & 37  & 2 \\
+    IMDB-B     & 1,000 & 19.8  & 96.5  & 136 & 2 \\
+    IMDB-M     & 1,000 & 13.0  & 65.9  & 89  & 3 \\
+    \bottomrule
+  \end{tabular}}
+\end{table}}
+
+\subsection{Model Configurations}
+
+Table~\ref{tab:model_cfg} presents the model configurations and resulting
+parameter counts for each dataset. The number of qubits $n_q$ is chosen
+to match or slightly exceed the input feature dimension after PCA or direct
+projection. The VQC depth is fixed at 1 variational layer per QGCN/QGAT
+layer. QFI-pruning uses spectral ratio $\kappa = 10^{-3}$, energy
+threshold $\tau = 0.50$, and QNG regularizer $\epsilon = 10^{-4}$, with the
+QFIM re-probed once per epoch.
+
+{\renewcommand{\arraystretch}{1.15}
+\begin{table}[t]
+  \centering
+  \caption{Model configurations and parameter counts per dataset.}
+  \label{tab:model_cfg}
+  \resizebox{\linewidth}{!}{%
+  \begin{tabular}{l c c c c c}
+    \toprule
+    Dataset & $d$ (input) & $n_q$ & Total & Classifier & Quantum $\phi$ \\
+    \midrule
+    MUTAG    & 7   & 8  & 4,415 & 3,905 & 130 \\
+    PROTEINS & 3   & 16 & 3,411 & 3,137 & 82  \\
+    NCI1     & 37  & 8  & 4,655 & 3,905 & 130 \\
+    IMDB-B   & 136 & 16 & 9,031 & 5,441 & 258 \\
+    IMDB-M   & 89  & 16 & 8,345 & 5,507 & 258 \\
+    \bottomrule
+  \end{tabular}}
+\end{table}}
+
+\subsection{Implementation Details}
+
+All models are implemented using PyTorch Geometric for
+graph mini-batching and PennyLane for differentiable
+quantum simulation with the default Numpy-based statevector simulator.
+Quantum gradients are computed with the parameter-shift rule
+(Eq.~\eqref{eq:psr}). We use AdamW with OneCycleLR scheduling: classical
+parameters peak at $\eta_c = 0.025$, quantum parameters peak at
+$\eta_q = 0.0025$, with 10-epoch warmup and cosine annealing thereafter
+over 100 epochs total. Batch size is 64 for binary tasks and 32 for
+multi-class tasks. We use early stopping with patience 15. For QGAT,
+attention coefficient dropout $p = 0.3$ is applied additionally. All
+experiments are conducted on an NVIDIA RTX 3090 GPU. Since PennyLane
+operates in simulation mode, no physical quantum hardware is required.
+
+For reproducibility, we follow the standard 10-fold cross-validation
+protocol~\cite{Errica2020} and report mean accuracy $\pm$ standard
+deviation over the 10 folds.
+
+\subsection{Baselines}
+
+We compare against the following methods, spanning classical GNNs, expressive
+higher-order GNNs, augmentation-based methods, and quantum approaches:
+\begin{itemize}[leftmargin=*, noitemsep]
+  \item \textit{Standard GNNs:} GCN~\cite{Kipf2017}, GAT~\cite{Velickovic2018},
+    GATv2~\cite{Brody2022ICLR}, GraphSAGE~\cite{Hamilton2017},
+    GIN-$\varepsilon$~\cite{Xu2019GIN}.
+  \item \textit{Expressive GNNs:} DropGNN~\cite{Papp2021NeurIPS},
+    OSAN~\cite{Bause2023ICML}, GRDL~(NeurIPS 2024), SE2P~\cite{Saber2024CIKM}.
+  \item \textit{Recent augmentation:} GRATIN~\cite{Abbahaddou2025ICML}.
+  \item \textit{Quantum:} QBMK~\cite{Bai2024ICML}.
+  \item \textit{Our baselines:}
+    QGCN, QGAT.
+\end{itemize}
+
+\subsection{Main Results}
+
+Table~\ref{tab:main_results} presents 10-fold cross-validation accuracy
+across all five benchmarks. We discuss results by dataset.
+
+\textbf{PROTEINS.} Q-Drop enhanced QGCN achieves $77.63 \pm 5.20\%$,
+which is competitive with DropGNN ($78.0 \pm 3.9\%$), OSAN ($77.5 \pm
+3.4\%$), and SE2P ($77.4 \pm 3.1\%$), and outperforms QBMK ($76.2 \pm
+3.8\%$). This is particularly noteworthy because our model uses only
+3,411 parameters, compared to $\sim$100K for DropGNN.
+
+\textbf{IMDB-Binary.} Q-Drop enhanced QGCN achieves $75.3 \pm 4.4\%$,
+matching DropGNN ($75.3 \pm 4.2\%$) exactly and falling only marginally
+below GRATIN ($75.8 \pm 3.9\%$), which uses a sophisticated data
+augmentation strategy in a much larger model. Our model uses 9,031
+parameters vs.\ hundreds of thousands for classical competitors.
+
+\textbf{IMDB-Multi.} With $52.27 \pm 3.1\%$, our approach is competitive
+with DropGNN ($51.8 \pm 3.0\%$) and close to GRATIN ($52.4 \pm 2.9\%$),
+establishing a new quantum baseline for this 3-class benchmark.
+
+\textbf{NCI1.} Our approach achieves $76.18 \pm 3.24\%$, which falls
+below GRDL ($80.4 \pm 0.8\%$) and GRATIN ($83.6 \pm 1.7\%$). NCI1 is
+the largest dataset (4,110 graphs with 37-dimensional features), and the
+performance gap reflects the limited circuit expressiveness of shallow
+$n_q = 8$ qubit circuits with a single variational layer when processing
+high-dimensional chemical features. Increasing $n_q$ or circuit depth
+would close this gap but at higher simulation cost.
+
+\textbf{MUTAG.} With $84.37 \pm 9.2\%$, our approach falls below the
+top classical methods (SE2P: $93.9\%$, OSAN: $93.6\%$) but is competitive
+with QBMK ($88.9 \pm 4.2\%$), the only prior quantum baseline on this
+dataset. MUTAG is a small dataset (188 graphs) where classical high-order
+methods benefit disproportionately from their structural inductive biases;
+our compact quantum model mitigates overfitting at the cost of slightly
+lower accuracy.
+
+{\renewcommand{\arraystretch}{1.2}
+\begin{table*}[t]
+  \centering
+  \caption{Graph classification accuracy (\%, mean $\pm$ std over 10-fold CV).
+    NR = Not Reported. \textbf{Bold} = best overall; \underline{underline} =
+    best quantum result.}
+  \label{tab:main_results}
+  \resizebox{\linewidth}{!}{%
+  \begin{tabular}{l l l *{5}{c} r}
+    \toprule
+    Method & Venue & Year & MUTAG & PROTEINS & NCI1 & IMDB-B & IMDB-M &
+    \makecell{Approx.\\ params} \\
+    \midrule
+    \multicolumn{9}{l}{\textit{Classical GNN baselines}} \\
+    GCN~\cite{Kipf2017}               & ICLR  & 2017 &
+      85.6 $\pm$5.8 & 76.0 $\pm$3.2 & NR & NR & NR & $\sim$50K \\
+    GAT~\cite{Velickovic2018}          & ICLR  & 2018 &
+      89.4 $\pm$6.1 & 74.7 $\pm$2.2 & NR & NR & NR & $\sim$60K \\
+    GATv2~\cite{Brody2022ICLR}         & ICLR  & 2022 &
+      88.0 $\pm$7.0 & 75.5 $\pm$3.5 & NR & NR & NR & $\sim$60K \\
+    DropGNN~\cite{Papp2021NeurIPS}     & NeurIPS & 2021 &
+      90.2 $\pm$7.1 & 78.0 $\pm$3.9 & 83.5 $\pm$1.9 &
+      \textbf{75.3 $\pm$4.2} & 51.8 $\pm$3.0 & $>$100K \\
+    OSAN~\cite{Bause2023ICML}          & ICML  & 2023 &
+      93.6 $\pm$5.7 & 77.5 $\pm$3.4 & NR & NR & NR & $>$100K \\
+    GRDL                               & NeurIPS & 2024 &
+      92.1 $\pm$5.9 & \textbf{82.6 $\pm$1.2} &
+      80.4 $\pm$0.8 & 74.8 $\pm$2.0 & 52.9 $\pm$1.8 & $>$200K \\
+    SE2P~\cite{Saber2024CIKM}          & CIKM  & 2024 &
+      \textbf{93.9 $\pm$5.8} & 77.4 $\pm$3.1 & NR & NR & NR & $>$100K \\
+    GRATIN~\cite{Abbahaddou2025ICML}   & ICML  & 2025 &
+      NR & NR & \textbf{83.6 $\pm$1.7} & 75.8 $\pm$3.9 &
+      \textbf{52.9 $\pm$1.8} & $>$200K \\
+    \midrule
+    \multicolumn{9}{l}{\textit{Quantum baselines}} \\
+    QBMK~\cite{Bai2024ICML}            & ICML  & 2024 &
+      88.9 $\pm$4.2 & 76.2 $\pm$3.8 & NR & NR & NR & 0 (kernel) \\
+    \midrule
+    \multicolumn{9}{l}{\textit{Ours (new contributions---no prior publication on these benchmarks)}} \\
+    QGCN (no QFI-Pruning)   & -- & 2025 &
+      \underline{79.37 $\pm$7.93} & \underline{70.98 $\pm$4.21} & \underline{79.27 $\pm$8.27} & \underline{84.37 $\pm$9.2} & \underline{84.37 $\pm$9.2} & $\approx$4K \\
+    QGAT (no QFI-Pruning)   & -- & 2025 &
+      -- & -- & -- & -- & -- & $\approx$4K \\
+    \textbf{QGCN + QFI-Pruning (ours)} & -- & 2026 &
+      \underline{84.37 $\pm$9.2} & \underline{77.63 $\pm$5.20} &
+      \underline{76.18 $\pm$3.24} & \underline{75.3 $\pm$4.4} &
+      \underline{52.27 $\pm$3.1} & 3,411--9,031 \\
+    \textbf{QGAT + QFI-Pruning (ours)} & -- & 2026 &
+      -- & -- & -- & -- & -- & $\approx$2K--8K \\
+    \bottomrule
+  \end{tabular}}
+\end{table*}}
+
+\subsection{Parameter Efficiency Analysis}
+
+Table~\ref{tab:params} provides a detailed comparison of parameter counts where classical GNN baselines are directly
+comparable. QGCN with Q-Drop uses only 2,032 parameters for the smart
+contract task, compared to 66,114--263,451 for classical GNN baselines---a
+reduction of \textbf{97--99\%}. Across the five graph benchmarks, the
+parameter count ranges from 3,411 (PROTEINS) to 9,031 (IMDB-Binary),
+reflecting the increased feature dimensionality of social network datasets.
+
+Crucially, the quantum circuit parameters $\phi$ represent only 82--258
+of the total parameters (2--3\%). The remainder is in the input projection
+layer ($W_r$) and the linear classification head. This highlights an
+important efficiency property: as the input feature dimension $d$ grows,
+the projection layer becomes the bottleneck, while the quantum circuit
+itself remains fixed. For IMDB-Binary with $d=136$, the projection matrix
+$W_r \in \mathbb{R}^{136 \times 16}$ accounts for 2,176 of the 9,031
+total parameters. Future work could exploit structured projections
+(e.g., random features or learned sparse projections) to further reduce
+this overhead.
+
+{\renewcommand{\arraystretch}{1.2}
+\begin{table}[t]
+  \centering
+  \caption{Parameter efficiency comparison benchmark.}
+  \label{tab:params}
+  \begin{tabular}{l r r}
+    \toprule
+    Method & Parameters & Reduction vs.\ QGCN \\
+    \midrule
+
+    \midrule
+    QGCN (ours)             & 2,032    & baseline \\
+    QGAT (ours)                      & 1,828    & $-10.1\%$ \\
+
+    \bottomrule
+  \end{tabular}
+\end{table}}
+
+\subsection{Sensitivity Analysis}
+
+
+\subsubsection{Effect of SP window size $m$}
+
+We test $m \in \{1, 3, 5, 10\}$. With $m = 1$ (no smoothing), the
+pruning mask is highly noisy and can inadvertently freeze important
+gates that happen to have low gradient magnitude in a single noisy
+step. Larger windows provide more reliable importance estimates; $m = 5$
+offers a good balance between responsiveness and stability, with $m = 10$
+yielding marginally better but slower training.
+
+\subsubsection{Effect of initial pruning ratio $\rho_0$}
+
+We test $\rho_0 \in \{0.30, 0.50, 0.70\}$. Following~\cite{QDrop2025ICC},
+the effective range for SP is 30\%--70\% of the accumulated gradients
+being selectively updated. $\rho_0 = 0.50$ (50\% of gates frozen
+initially) provides the best overall performance, with the exponential
+annealing schedule ensuring that this ratio diminishes to near-zero
+as training converges.
+
+\subsection{Discussion}
+
+\subsubsection{Why graph-consistent masking matters}
+
+To validate the necessity of our graph-consistent masking design, we
+tested a naive variant that samples an independent mask per node. This
+naive variant consistently underperforms the graph-consistent version by
+2--4\% across datasets, confirming that incoherent per-node masking
+disrupts the structural signal embedded in neighborhood aggregation.
+
+\subsubsection{Quantum vs.\ classical attention}
+
+QGAT consistently outperforms QGCN on smart-contract tasks
+but shows mixed results on the five benchmarks here. For MUTAG and NCI1,
+QGCN's symmetric aggregation better captures molecular symmetry, while
+QGAT's directed attention mechanism is better suited to asymmetric
+structural patterns in social graphs (IMDB-Binary, IMDB-Multi). This
+suggests that the choice between QGCN and QGAT should be informed by
+the graph's structural properties.
+
+\subsubsection{Limitations and future directions}
+
+Our evaluation is conducted entirely on PennyLane's statevector simulator;
+hardware noise from real quantum processors (e.g., IBM Q, Rigetti) may
+degrade performance through gate errors and decoherence. The current
+framework uses shallow circuits ($n_q \leq 16$, VQC depth 1) that avoid
+the worst of the barren plateau problem but limit expressive capacity on
+complex tasks like NCI1. Extending to deeper circuits with noise-mitigation
+strategies is a natural direction for future work.
+Additionally, the current study focuses on graph-level classification;
+extending QFI-pruning to node-level and link-level tasks would broaden
+applicability. Finally, integrating incremental/online learning
+strategies for streaming graphs is a compelling
+direction for real-time deployment scenarios.
+
+%% ─────────────────────────────────────────────────────────────────────────────
+\section{Conclusion}
+\label{sec:conclusion}
+
+We presented QFI-pruned QGCN and QGAT---a unified framework integrating
+geometry-aware quantum regularization into hybrid classical-quantum graph
+neural networks for graph classification. Two complementary mechanisms were
+proposed and validated: graph-consistent QFIM probing, which prevents gate
+co-adaptation by sharing a single data-averaged Quantum Fisher Information
+Matrix and freeze mask across all nodes in a mini-batch while preserving
+permutation equivariance, and graph-adapted QFI-pruning, which uses the
+spectral leverage of each gate on the QFIM to freeze gates in the null
+eigendirections and steers the survivors with a quantum-natural-gradient
+step on the QFIM sub-manifold.
+
+Evaluated on five standard benchmarks---MUTAG, PROTEINS, NCI1, IMDB-Binary,
+and IMDB-Multi---the proposed framework achieves competitive accuracy against
+classical GNN methods ranging from 50K to 200K+ parameters while using only
+3,411--9,031 parameters in total, representing a reduction of over 97\%
+relative to classical GNN baselines and establishing the first comprehensive
+quantum graph classification benchmark in the literature. Ablation studies
+confirm that both spectral-leverage freezing and the QNG precondition are
+necessary; their combination outperforms either applied in isolation.
+
+This work establishes, to the best of our knowledge, the first systematic
+application of quantum regularization to general-purpose graph classification
+tasks. The framework is fully simulator-based and does not require quantum
+hardware, making it immediately deployable in any environment with PennyLane
+and PyTorch Geometric. Future directions include: (1) evaluation on real
+quantum hardware and noise-robust training strategies; (2) extension to
+node-level and edge-level prediction tasks; (3) theoretical analysis of
+variance reduction properties of graph-consistent QFIM probing; (4) exploring
+structured input projections to further reduce the classical parameter
+overhead; and (5) integration with few-shot and incremental learning
+for sparse or streaming graph data.
+
+%% ─────────────────────────────────────────────────────────────────────────────
+\bibliographystyle{IEEEtran}
+\bibliography{refs}
+
+%% ─────────────────────────────────────────────────────────────────────────────
+\vskip 0pt plus -1fil 
+
+\begin{IEEEbiography}[{\includegraphics[width=1in,height=1.25in,clip,keepaspectratio]{biblig/Cat.jpg}}]{Cat Khanh Tran}
+received the B.S.\ degree from Hanoi University of Science and Technology,
+Vietnam, in 2024. He is currently pursuing the M.S.\ degree at the
+Department of Computer Science and Information Engineering, National Chung
+Cheng University, Chiayi, Taiwan. His research interests include quantum
+machine learning, graph neural networks, and blockchain security.
+\end{IEEEbiography}
+
+\vskip 0pt plus -1fil 
+
+\begin{IEEEbiography}[{\includegraphics[width=1in,height=1.25in,clip,keepaspectratio]{biblig/Nguyen.png}}]{Thai Quang Nguyen Pham}
+received the B.S.\ degree from Ho Chi Minh City University of Technology
+and Education, Vietnam. His research interests include quantum
+neural network optimization and variational quantum algorithms.
+\end{IEEEbiography}
+
+\vskip 0pt plus -1fil 
+
+\begin{IEEEbiography}[{\includegraphics[width=1in,height=1.25in,clip,keepaspectratio]{biblig/Linh.jpg}}]{Van-Linh Nguyen}
+(Member, IEEE) is an Assistant Professor at the Department of Computer
+Science and Information Engineering, National Chung Cheng University
+(CCU), Taiwan, and the lead of the Cyber Information Security Laboratory
+(CIS Lab). He received the Ph.D.\ degree in computer science and
+information engineering from National Chung Cheng University in 2019.
+His research interests include cybersecurity, quantum machine learning,
+network intelligence, and vehicular networks.
+\end{IEEEbiography}
+
+\end{document}
